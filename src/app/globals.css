@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+:root {
+  --background: #FAFAFA;
+  --foreground: #171717;
+  --surface: #ffffff;
+  --border: #e5e5e5;
+
+  --color-primary-purple: #7B2FF7;
+  --color-primary-pink: #FF5C8A;
+  --color-success: #2ECC71;
+  --color-warning: #FFB84D;
+  --color-error: #E74C3C;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-primary-purple: var(--color-primary-purple);
+  --color-primary-pink: var(--color-primary-pink);
+  --color-success: var(--color-success);
+  --color-warning: var(--color-warning);
+  --color-error: var(--color-error);
+  --font-sans: var(--font-inter);
+  --radius-card: 12px;
+  --radius-button: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #121212;
+    --foreground: #ededed;
+    --surface: #1a1a1a;
+    --border: #2a2a2a;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-inter), system-ui, sans-serif;
+}
+
+@keyframes skeleton-pulse {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.skeleton {
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+  background: var(--border);
+}
+
+.tap-scale {
+  transition: transform 0.1s ease;
+}
+
+.tap-scale:active {
+  transform: scale(0.96);
+}
+
+@keyframes card-exit {
+  to {
+    opacity: 0;
+    transform: translateX(24px) scale(0.98);
+  }
+}
+
+.card-exit {
+  animation: card-exit 0.25s ease forwards;
+}
+
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.card-enter {
+  animation: card-enter 0.25s ease;
+}

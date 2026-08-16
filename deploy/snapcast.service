@@ -1,0 +1,34 @@
+# systemd unit — keeps the app running and restarts it on crash or reboot.
+# Install:  cp deploy/snapcast.service /etc/systemd/system/
+#           systemctl daemon-reload && systemctl enable --now snapcast
+
+[Unit]
+Description=Snapcast Studio
+After=network.target
+
+[Service]
+Type=simple
+User=snapcast
+Group=snapcast
+WorkingDirectory=/srv/snapcast
+EnvironmentFile=/srv/snapcast/.env
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+
+# ffmpeg jobs are memory-hungry; give the process room but don't let a
+# runaway encode take the whole box down.
+MemoryMax=1500M
+
+# Basic hardening — the app only needs to write its own dirs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/srv/snapcast /var/lib/snapcast
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snapcast
+
+[Install]
+WantedBy=multi-user.target

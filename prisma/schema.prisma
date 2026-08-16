@@ -1,0 +1,268 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Account {
+  id           String   @id @default(cuid())
+  businessName String
+  email        String   @unique
+  passwordHash String
+
+  // "client" | "admin" — plain string, SQLite has no enum type. Admin
+  // accounts get a completely separate area (/admin) clients never see a
+  // link to; a client account is rejected at /admin/login even with a
+  // correct password.
+  role String @default("client")
+
+  // Credit-based billing: each Event created consumes one credit from the
+  // monthly plan allotment, then from extraCredits once the plan is used
+  // up. periodStartedAt drives a lazy monthly reset (checked on use, no
+  // cron needed at this scale).
+  planEventsPerMonth Int      @default(5)
+  extraCredits       Int      @default(0)
+  periodEventsUsed    Int      @default(0)
+  periodStartedAt     DateTime @default(now())
+
+  // Brand profile, captured via the onboarding style quiz.
+  brandLogoUrl String?
+  // "playful" | "elegant" | "professional" — plain string, SQLite has no enum type.
+  brandTone    String  @default("playful")
+  // JSON-encoded array of hex colors, e.g. ["#7C3AED", "#FF6584"].
+  brandColors  String  @default("[]")
+
+  // Shared secret for the generic webhook receiver — booth software (e.g.
+  // Snappic) signs pushed content with this so /api/webhooks/[accountId]
+  // can verify the sender.
+  webhookSecret String @default(cuid())
+
+  // Trust Mode: after enough clean (un-edited) approvals in a row, the
+  // client can flip on auto-posting for channels that support it instead of
+  // reviewing every draft. Resets to 0 on any edit or skip.
+  consecutiveApprovals Int     @default(0)
+  trustModeEnabled     Boolean @default(false)
+
+  // Opt-in — off by default. When on, /guest/[eventId] lets event guests
+  // browse and claim/share photos, auto-tagging the business.
+  guestPortalEnabled Boolean @default(false)
+
+  sessions      Session[]
+  events        Event[]
+  guestClaims   GuestClaim[]
+  blogPosts     BlogPost[]
+  adminNotes    AdminNote[]
+  checklist     OnboardingChecklistItem[]
+  usageEvents   UsageEvent[]
+
+  createdAt DateTime @default(now())
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id])
+  expiresAt DateTime
+
+  // Set when an admin started this session via impersonation, so the UI can
+  // show a "viewing as X — return to admin" banner and the return path can
+  // restore the admin's own session rather than just logging out.
+  impersonatedByAccountId String?
+
+  @@index([accountId])
+}
+
+// Every admin-side action that touches a client account — impersonation,
+// credit grants, note additions, flag toggles, bulk actions — logs here.
+model AuditLog {
+  id              String   @id @default(cuid())
+  actorAccountId  String?
+  targetAccountId String?
+  action          String
+  detail          String?
+  createdAt       DateTime @default(now())
+
+  @@index([targetAccountId, createdAt])
+}
+
+model FeatureFlag {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  enabled     Boolean  @default(false)
+  description String?
+  updatedAt   DateTime @updatedAt
+}
+
+model AdminNote {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id])
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([accountId, createdAt])
+}
+
+// One row per billable AI call, so admin cost monitoring reflects real
+// usage over time rather than a single cumulative counter. Cost is an
+// estimate (flat per-call-type figure, not real token accounting).
+model UsageEvent {
+  id                 String   @id @default(cuid())
+  accountId          String
+  account            Account  @relation(fields: [accountId], references: [id])
+  // caption | clip | blog_post | regenerate
+  kind               String
+  estimatedCostCents Int
+  createdAt          DateTime @default(now())
+
+  @@index([accountId, createdAt])
+}
+
+model OnboardingChecklistItem {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id])
+  label     String
+  completed Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([accountId])
+}
+
+model Event {
+  id        String    @id @default(cuid())
+  accountId String
+  account   Account   @relation(fields: [accountId], references: [id])
+  name      String
+
+  // wedding | corporate | birthday | other — adjusts AI tone/pacing/caption style.
+  eventType String @default("other")
+
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+
+  media       Media[]
+  drafts      Draft[]
+  guestClaims GuestClaim[]
+  blogPost    BlogPost?
+
+  @@index([accountId, startedAt])
+}
+
+// Optional, per-event. Only created when the client actually provides notes
+// — no notes, no blog post. Ties into local-SEO strategy (one indexable
+// page per event) rather than being generated speculatively from photos.
+model BlogPost {
+  id        String  @id @default(cuid())
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+  eventId   String  @unique
+  event     Event   @relation(fields: [eventId], references: [id])
+
+  inputNotes       String
+  generatedContent String
+  editedContent    String?
+
+  // pending | approved | edited
+  status String @default("pending")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Media {
+  id        String  @id @default(cuid())
+  // Denormalized alongside eventId so tenant isolation never depends on a
+  // join being written correctly everywhere.
+  accountId String
+  eventId   String
+  event     Event   @relation(fields: [eventId], references: [id])
+
+  // photo | video
+  mediaType String
+
+  storagePath String
+  sourceUrl   String
+
+  // pending | ready | failed
+  status String @default("pending")
+
+  // Set when this row is a generated clip rather than a direct upload —
+  // points back at the source video it was cut from.
+  sourceMediaId   String?
+  sourceMedia     Media?  @relation("MediaClips", fields: [sourceMediaId], references: [id])
+  clips           Media[] @relation("MediaClips")
+  clipStartSeconds Float?
+  clipEndSeconds   Float?
+  // Track name/id from the music catalog chosen for this clip, if any.
+  musicTrack       String?
+  // JSON array of source Media ids, set when this row is a photo-montage
+  // video compiled from several photos rather than cut from one video.
+  compiledFromMediaIds String?
+
+  // Visual scoring (0-100), set once per media alongside caption generation
+  // — shared across all platform/variant drafts for the same photo or clip.
+  energyScore        Int?
+  visualQualityScore Int?
+  momentRarityScore  Int?
+  scoreSummary       String?
+
+  drafts      Draft[]
+  guestClaims GuestClaim[]
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId, eventId])
+}
+
+// Lightweight lead-capture log: who claimed/shared which photo from the
+// guest portal. Doubles as growth-performance data for future sales proof.
+model GuestClaim {
+  id        String  @id @default(cuid())
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+  eventId   String
+  event     Event   @relation(fields: [eventId], references: [id])
+  mediaId   String
+  media     Media   @relation(fields: [mediaId], references: [id])
+
+  guestName    String?
+  guestContact String?
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId, eventId])
+}
+
+model Draft {
+  id        String  @id @default(cuid())
+  accountId String
+  eventId   String
+  event     Event   @relation(fields: [eventId], references: [id])
+  mediaId   String
+  media     Media   @relation(fields: [mediaId], references: [id])
+
+  // instagram | facebook | tiktok
+  platform String
+
+  // Which of the ~2 generated options this is, so the review feed can offer
+  // real choice per platform instead of a single take.
+  variantIndex Int @default(0)
+
+  generatedCaption String
+  editedCaption    String?
+
+  // pending | approved | edited | skipped
+  status String @default("pending")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId, eventId, status])
+}

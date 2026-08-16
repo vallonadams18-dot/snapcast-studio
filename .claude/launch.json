@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "snapcast-dev",
+      "runtimeExecutable": "C:\\Users\\volda\\AppData\\Local\\Programs\\nodejs-portable\\node-v22.14.0-win-x64\\npm.cmd",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000
+    }
+  ]
+}
