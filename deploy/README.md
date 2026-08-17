@@ -125,6 +125,20 @@ free -h                            # out of memory? (ffmpeg is hungry)
 **Video jobs failing but photos fine** — almost always memory. Check `free -h`
 during an encode; resize the droplet if it's exhausted.
 
+**Uploaded photos/videos 404 or show as broken images** — the nginx
+`location /uploads/` block is missing or points at the wrong path. Next does
+**not** serve runtime-written files out of `public/` in production, so nginx
+has to. Check with:
+
+```
+curl -I http://localhost/uploads/SOME_EVENT_ID/SOME_FILE.jpg
+ls /srv/snapcast/public/uploads          # is the file actually on disk?
+```
+
+A 404 from nginx with the file present on disk means the `alias` path is
+wrong. A 404 with nothing on disk means the upload itself failed — check
+`journalctl -u snapcast`.
+
 **Captions are generic placeholder text** — `ANTHROPIC_API_KEY` isn't set or
 isn't reaching the process. Confirm with
 `systemctl show snapcast -p Environment`, and remember the service reads

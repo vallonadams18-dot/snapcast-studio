@@ -12,8 +12,15 @@ export interface StorageAdapter {
   save(key: string, buffer: Buffer, contentType: string): Promise<SavedFile>;
 }
 
-// Local disk — writes into public/uploads and returns a same-origin URL that
-// Next's static file server handles for free. This is today's default.
+// Local disk — writes into public/uploads and returns a same-origin URL.
+// This is today's default.
+//
+// IMPORTANT: `next start` serves public/ from a manifest computed at BUILD
+// time, so files written here at runtime are NOT served by Next in
+// production — they 404. In dev it works, which makes this easy to miss.
+// Production therefore serves /uploads/ straight from disk via nginx; see
+// the `location /uploads/` block in deploy/nginx-snapcast.conf. If you
+// deploy somewhere without that nginx config, uploads will not load.
 class LocalDiskAdapter implements StorageAdapter {
   async save(key: string, buffer: Buffer): Promise<SavedFile> {
     const { mkdir, writeFile } = await import("node:fs/promises");
