@@ -22,6 +22,9 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
   if (!event) notFound();
 
   const pendingCount = await prisma.draft.count({ where: { eventId, status: "pending" } });
+  const approvedCount = await prisma.draft.count({
+    where: { eventId, status: { in: ["approved", "edited"] } },
+  });
   const readyPhotoCount = event.media.filter((m) => m.mediaType === "photo" && m.status === "ready").length;
 
   const headerList = await headers();
@@ -49,6 +52,15 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
           className="tap-scale mt-4 block rounded-lg bg-gradient-to-r from-primary-purple to-primary-pink px-4 py-3 text-center font-semibold text-white shadow-md shadow-primary-pink/20"
         >
           Review drafts ({pendingCount} waiting)
+        </a>
+      )}
+
+      {approvedCount > 0 && (
+        <a
+          href={`/events/${event.id}/approved`}
+          className="tap-scale mt-2 block rounded-lg border border-border bg-surface px-4 py-3 text-center font-medium text-foreground hover:border-primary-pink"
+        >
+          Approved content ({approvedCount}) — download &amp; post
         </a>
       )}
 

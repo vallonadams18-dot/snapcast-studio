@@ -44,9 +44,12 @@ next-env.d.ts
 
 /src/generated/prisma
 
-# sqlite dev db
+# sqlite dev db — including the WAL sidecar files, which hold real committed
+# rows and would leak database contents into the repo.
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # user uploads
 /public/uploads

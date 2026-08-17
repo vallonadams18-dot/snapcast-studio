@@ -190,7 +190,7 @@ function DraftCard({
   );
 }
 
-export function ReviewFeed({ initialDrafts }: { initialDrafts: DraftItem[] }) {
+export function ReviewFeed({ initialDrafts, eventId }: { initialDrafts: DraftItem[]; eventId: string }) {
   const [drafts, setDrafts] = useState(initialDrafts);
   const [selectedVariants, setSelectedVariants] = useState<Record<string, number>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -309,6 +309,15 @@ export function ReviewFeed({ initialDrafts }: { initialDrafts: DraftItem[] }) {
           title="All caught up"
           description="No drafts left to review. Upload more photos or video to generate new ones."
         />
+        {/* Finishing the queue is exactly when you want what you just
+            approved — without this the content is only reachable by
+            guessing the URL. */}
+        <a
+          href={`/events/${eventId}/approved`}
+          className="tap-scale mt-3 block rounded-lg bg-gradient-to-r from-primary-purple to-primary-pink px-4 py-3 text-center font-semibold text-white"
+        >
+          View approved content
+        </a>
       </div>
     );
   }

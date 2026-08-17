@@ -30,6 +30,7 @@ export default async function ReviewPage({ params }: { params: Promise<{ eventId
         your uploaded photo or video, which is always safe in the event gallery.
       </p>
       <ReviewFeed
+        eventId={eventId}
         initialDrafts={drafts.map((d) => ({
           id: d.id,
           mediaId: d.mediaId,
