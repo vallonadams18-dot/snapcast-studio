@@ -6,9 +6,10 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { createPhotoMontage, DEFAULT_MONTAGE_SECONDS_PER_PHOTO } from "@/lib/video";
+import { createPhotoMontage, montageDurationSeconds } from "@/lib/video";
 import { mixTrackIntoClip } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
+import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
 import { analyzeClip, PLATFORMS } from "@/lib/ai";
 import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
@@ -16,9 +17,8 @@ import { isFeatureEnabled } from "@/lib/featureFlags";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
-const SECONDS_PER_PHOTO = DEFAULT_MONTAGE_SECONDS_PER_PHOTO;
 
-export async function POST(_request: Request, { params }: { params: Promise<{ eventId: string }> }) {
+export async function POST(request: Request, { params }: { params: Promise<{ eventId: string }> }) {
   const account = await getCurrentAccount();
   if (!account) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
 
@@ -33,6 +33,13 @@ export async function POST(_request: Request, { params }: { params: Promise<{ ev
   const { eventId } = await params;
   const event = await prisma.event.findFirst({ where: { id: eventId, accountId: account.id } });
   if (!event) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+  // Body is optional — an omitted/!json body just means "pick for me".
+  const body = await request.json().catch(() => ({}) as Record<string, unknown>);
+  const style =
+    typeof body.styleId === "string"
+      ? getMontageStyle(body.styleId)
+      : suggestStyleForEventType(event.eventType);
 
   const candidates = await prisma.media.findMany({
     where: { eventId, accountId: account.id, mediaType: "photo", status: "ready" },
@@ -66,11 +73,11 @@ export async function POST(_request: Request, { params }: { params: Promise<{ ev
     }
 
     const montagePath = path.join(tmpDir, "montage.mp4");
-    await createPhotoMontage({ photoPaths, secondsPerPhoto: SECONDS_PER_PHOTO, outputPath: montagePath });
+    await createPhotoMontage({ photoPaths, style, outputPath: montagePath });
 
     let montageBuffer = await readFile(montagePath);
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
-    const totalDuration = selected.length * SECONDS_PER_PHOTO;
+    const totalDuration = montageDurationSeconds(selected.length, style);
 
     const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration);
     if (mixed) montageBuffer = mixed;
@@ -111,7 +118,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ ev
       ),
     });
 
-    return NextResponse.json({ montage, photoCount: selected.length });
+    return NextResponse.json({ montage, photoCount: selected.length, style: style.name });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Couldn't compile a video from your photos. Try again in a moment." },

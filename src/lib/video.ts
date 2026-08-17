@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { getAnthropicClient } from "@/lib/ai";
 import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
+import type { MontageStyle } from "@/lib/montageStyles";
 
 // ffmpeg's filtergraph mini-language treats `:`, `\`, and unescaped `'` as
 // syntax, so any path fed into a filter option (fontfile=, textfile=) needs
@@ -227,45 +228,149 @@ export async function createVerticalClip(options: CreateClipOptions): Promise<vo
 
 const MONTAGE_FPS = 25;
 
-// One photo → one short vertical clip with a slow Ken Burns zoom. Falls
-// back to a plain static-frame segment if zoompan misbehaves on this
-// ffmpeg build (same defensive pattern as the drawtext fallback above) —
-// a slideshow with hard cuts still beats losing the whole feature.
-async function createPhotoSegment(photoPath: string, secondsPerPhoto: number, outputPath: string): Promise<void> {
-  const frameCount = Math.round(secondsPerPhoto * MONTAGE_FPS);
-  const kenBurnsFilter = [
-    ...CROP_FILTERS,
-    `zoompan=z='min(zoom+0.0012,1.12)':d=${frameCount}:s=1080x1920:fps=${MONTAGE_FPS}`,
-  ].join(",");
+// zoompan works in whole frames, and it re-evaluates its expression per
+// output frame, so motion is expressed as "how much per frame".
+function motionFilter(motion: MontageStyle["motion"], frameCount: number, index: number): string | null {
+  const size = `:d=${frameCount}:s=1080x1920:fps=${MONTAGE_FPS}`;
+  // Centre the zoom origin. zoompan's default origin is the top-left, which
+  // makes a zoom drift toward the corner and slide the subject out of frame.
+  const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
 
-  const inputArgs = ["-loop", "1", "-i", photoPath, "-t", String(secondsPerPhoto)];
-  const outputArgs = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", outputPath];
-
-  try {
-    await runFfmpeg([...inputArgs, "-vf", kenBurnsFilter, ...outputArgs]);
-  } catch {
-    await runFfmpeg([...inputArgs, "-vf", CROP_FILTERS.join(","), ...outputArgs]);
+  switch (motion) {
+    case "zoom-in":
+      return `zoompan=z='min(zoom+0.0009,1.14)'${centre}${size}`;
+    case "zoom-out":
+      // Start pushed in and pull back. zoom starts at 1.14 and eases down.
+      return `zoompan=z='if(eq(on,1),1.14,max(zoom-0.0009,1.0))'${centre}${size}`;
+    case "pan-right":
+      // Hold a slight zoom so there's headroom to travel across.
+      return `zoompan=z='1.12':x='(iw-iw/zoom)*(on/${frameCount})':y='ih/2-(ih/zoom/2)'${size}`;
+    case "alternate":
+      // Alternating push/pull is what gives a fast cut sequence its rhythm —
+      // every photo moving the same direction reads as one long drift.
+      return index % 2 === 0
+        ? `zoompan=z='min(zoom+0.0016,1.18)'${centre}${size}`
+        : `zoompan=z='if(eq(on,1),1.18,max(zoom-0.0016,1.0))'${centre}${size}`;
+    case "none":
+      return null;
   }
 }
 
-// Exported so callers elsewhere (e.g. re-mixing audio on an existing
-// montage) can compute its total duration without re-deriving this number.
-export const DEFAULT_MONTAGE_SECONDS_PER_PHOTO = 2.5;
+// Fits the photo into a 9:16 frame WITHOUT cropping the subject out: the
+// whole photo is scaled to fit, and the empty sides are filled with a
+// blurred, zoomed copy of the same photo. This is what Reels/TikTok do, and
+// it's the fix for landscape group shots losing everyone at the edges — a
+// plain center-crop to 1080x1920 discards most of a 3:2 frame's width.
+const BLURRED_FIT_FILTER = [
+  "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=32[bg]",
+  "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]",
+  "[bg][fg]overlay=(W-w)/2:(H-h)/2",
+].join(";");
+
+// One photo → one vertical segment with the style's fit and camera move.
+// Degrades in two steps rather than failing: motion dropped first, then the
+// blurred fit — a plain slideshow still beats losing the feature entirely.
+async function createPhotoSegment(
+  photoPath: string,
+  style: MontageStyle,
+  index: number,
+  outputPath: string,
+): Promise<void> {
+  const frameCount = Math.round(style.secondsPerPhoto * MONTAGE_FPS);
+  const motion = motionFilter(style.motion, frameCount, index);
+
+  const inputArgs = ["-loop", "1", "-i", photoPath, "-t", String(style.secondsPerPhoto)];
+  const outputArgs = ["-r", String(MONTAGE_FPS), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", outputPath];
+
+  // Ordered best → simplest. First that succeeds wins.
+  const attempts: string[][] = [];
+
+  if (style.fit === "blurred") {
+    const chain = motion ? `${BLURRED_FIT_FILTER},${motion}` : BLURRED_FIT_FILTER;
+    attempts.push(["-filter_complex", chain]);
+    attempts.push(["-filter_complex", BLURRED_FIT_FILTER]);
+  } else {
+    const chain = motion ? [...CROP_FILTERS, motion].join(",") : CROP_FILTERS.join(",");
+    attempts.push(["-vf", chain]);
+  }
+  attempts.push(["-vf", CROP_FILTERS.join(",")]);
+
+  let lastError: unknown;
+  for (const filterArgs of attempts) {
+    try {
+      await runFfmpeg([...inputArgs, ...filterArgs, ...outputArgs]);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+// Cross-fades between segments using xfade, which needs ffmpeg 4.3+.
+// Returns false when unavailable (or when the graph fails) so the caller
+// can fall back to hard cuts instead of producing nothing.
+async function concatWithTransitions(
+  segmentPaths: string[],
+  style: MontageStyle,
+  outputPath: string,
+): Promise<boolean> {
+  if (style.transition === "cut" || segmentPaths.length < 2) return false;
+
+  const inputs = segmentPaths.flatMap((p) => ["-i", p]);
+  const d = style.transitionSeconds;
+  const steps: string[] = [];
+  let current = "[0:v]";
+  // Each xfade overlaps the pair by `d`, so the running length of everything
+  // merged so far is (n * segment) - (transitions * d). The next offset is
+  // that length minus one more transition.
+  let elapsed = style.secondsPerPhoto;
+
+  for (let i = 1; i < segmentPaths.length; i++) {
+    const label = i === segmentPaths.length - 1 ? "[out]" : `[v${i}]`;
+    const offset = Math.max(0, elapsed - d);
+    steps.push(`${current}[${i}:v]xfade=transition=${style.transition}:duration=${d}:offset=${offset}${label}`);
+    current = label;
+    elapsed = offset + style.secondsPerPhoto;
+  }
+
+  try {
+    await runFfmpeg([
+      ...inputs,
+      "-filter_complex", steps.join(";"),
+      "-map", "[out]",
+      "-r", String(MONTAGE_FPS),
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      "-y", outputPath,
+    ]);
+    return true;
+  } catch (err) {
+    console.error("[video] xfade transitions unavailable, using hard cuts", err);
+    return false;
+  }
+}
 
 export interface PhotoMontageOptions {
   // In display order — first photo opens the video.
   photoPaths: string[];
-  secondsPerPhoto?: number;
+  style: MontageStyle;
   outputPath: string;
 }
 
-// Compiles several photos into one vertical video with a Ken Burns zoom per
-// photo and hard cuts between them — the same shape as an Instagram/TikTok
-// photo-slideshow post. Silent; mix in music separately via
-// lib/music.ts#mixTrackIntoClip, which works on any video regardless of
-// whether it already has an audio track.
+// Total runtime of a montage, accounting for transition overlap. Callers
+// need this to trim the music track to length.
+export function montageDurationSeconds(photoCount: number, style: MontageStyle): number {
+  const raw = photoCount * style.secondsPerPhoto;
+  if (style.transition === "cut" || photoCount < 2) return raw;
+  return raw - (photoCount - 1) * style.transitionSeconds;
+}
+
+// Compiles photos into one vertical video in the chosen style. Silent; mix
+// music in separately via lib/music.ts#mixTrackIntoClip, which works on any
+// video whether or not it already has an audio track.
 export async function createPhotoMontage(options: PhotoMontageOptions): Promise<void> {
-  const secondsPerPhoto = options.secondsPerPhoto ?? DEFAULT_MONTAGE_SECONDS_PER_PHOTO;
+  const { style } = options;
   if (options.photoPaths.length === 0) throw new Error("No photos to compile");
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-montage-"));
@@ -273,8 +378,14 @@ export async function createPhotoMontage(options: PhotoMontageOptions): Promise<
     const segmentPaths: string[] = [];
     for (const [i, photoPath] of options.photoPaths.entries()) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
-      await createPhotoSegment(photoPath, secondsPerPhoto, segPath);
+      await createPhotoSegment(photoPath, style, i, segPath);
       segmentPaths.push(segPath);
+    }
+
+    // Preferred path: real transitions between shots. Returns false on
+    // ffmpeg builds without xfade (< 4.3), where we fall through to cuts.
+    if (await concatWithTransitions(segmentPaths, style, options.outputPath)) {
+      return;
     }
 
     const concatListPath = path.join(tmpDir, "concat.txt");

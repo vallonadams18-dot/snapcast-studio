@@ -9,6 +9,7 @@ import { VideoClipButton } from "./VideoClipButton";
 import { MusicPicker } from "./MusicPicker";
 import { BlogPostSection } from "./BlogPostSection";
 import { PhotoMontageButton } from "./PhotoMontageButton";
+import { suggestStyleForEventType } from "@/lib/montageStyles";
 
 export default async function EventPage({ params }: { params: Promise<{ eventId: string }> }) {
   const account = await getCurrentAccount();
@@ -44,7 +45,11 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
 
       <BlogPostSection eventId={event.id} initialPost={event.blogPost} />
 
-      <PhotoMontageButton eventId={event.id} readyPhotoCount={readyPhotoCount} />
+      <PhotoMontageButton
+        eventId={event.id}
+        readyPhotoCount={readyPhotoCount}
+        suggestedStyleId={suggestStyleForEventType(event.eventType).id}
+      />
 
       {pendingCount > 0 && (
         <a
