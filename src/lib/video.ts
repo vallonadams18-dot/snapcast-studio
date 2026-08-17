@@ -226,6 +226,27 @@ export async function createVerticalClip(options: CreateClipOptions): Promise<vo
   await runFfmpeg([...inputArgs, "-vf", CROP_FILTERS.join(","), ...outputArgs]);
 }
 
+// Trims an already-rendered video to a sub-range. Re-encodes rather than
+// stream-copying: a copy can only cut on keyframes, so the result would
+// start late or open on a frozen frame, and the trimmed audio would drift.
+export async function trimVideo(opts: {
+  sourcePath: string;
+  startSeconds: number;
+  endSeconds: number;
+  outputPath: string;
+}): Promise<void> {
+  const duration = Math.max(0.5, opts.endSeconds - opts.startSeconds);
+  await runFfmpeg([
+    "-ss", String(Math.max(0, opts.startSeconds)),
+    "-i", opts.sourcePath,
+    "-t", String(duration),
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-y", opts.outputPath,
+  ]);
+}
+
 const MONTAGE_FPS = 25;
 
 // zoompan works in whole frames, and it re-evaluates its expression per
