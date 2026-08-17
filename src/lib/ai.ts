@@ -305,6 +305,106 @@ export async function regenerateCaption(
   return analysis.captions[platform][0];
 }
 
+const PLATFORM_GUIDE: Record<Platform, string> = {
+  instagram: "short, punchy, 1-2 relevant hashtags",
+  facebook: "warmer and a bit longer, no hashtags",
+  tiktok: "casual, trend-aware, very short",
+};
+
+// "Modify" rather than a blind re-roll: the client says what's wrong ("too
+// long", "mention the venue") and that steers the rewrite. Takes the
+// current caption as the starting point so the result is a revision rather
+// than an unrelated new take.
+export async function reviseCaption(
+  media: Media,
+  event: Event,
+  account: Account,
+  platform: Platform,
+  currentCaption: string,
+  guidance: string,
+): Promise<string | null> {
+  const anthropic = getAnthropicClient();
+  if (!anthropic) return null;
+
+  try {
+    const buffer = await getMediaBytes(media);
+    const examples = await getBrandVoiceExamples(account.id);
+    const exampleBlock =
+      examples.length > 0
+        ? `\nCaptions this client has previously approved (match this voice):\n${examples.map((e) => `- ${e}`).join("\n")}`
+        : "";
+
+    const response = await anthropic.beta.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 2048,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      output_config: {
+        effort: "low",
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { caption: { type: "string" } },
+            required: ["caption"],
+            additionalProperties: false,
+          },
+        },
+      },
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: extToMimeType(media.storagePath) as
+                  | "image/jpeg"
+                  | "image/png"
+                  | "image/webp"
+                  | "image/gif",
+                data: buffer.toString("base64"),
+              },
+            },
+            {
+              type: "text",
+              text: [
+                `This is a photo from "${event.name}", a ${event.eventType} event hosted by ${account.businessName}.`,
+                "",
+                `The current ${platform} caption is:`,
+                currentCaption,
+                "",
+                `The client wants it changed. Their instruction: "${guidance}"`,
+                "",
+                `Rewrite the caption following that instruction. Keep it suitable for ${platform} (${PLATFORM_GUIDE[platform]}) and in a ${account.brandTone} brand voice.${exampleBlock}`,
+                "Return only the revised caption.",
+              ].join("\n"),
+            },
+          ],
+        },
+      ],
+    });
+
+    if (response.stop_reason === "refusal") {
+      console.error("[ai] Claude refused the caption revision", response.stop_details);
+      return null;
+    }
+    const parsed = response.content.find((block) => block.type === "text");
+    if (!parsed || parsed.type !== "text") {
+      console.error("[ai] No text block in revision response", { stopReason: response.stop_reason });
+      return null;
+    }
+
+    const json = JSON.parse(parsed.text) as { caption?: string };
+    const caption = json.caption?.trim();
+    return caption || null;
+  } catch (err) {
+    console.error("[ai] reviseCaption failed", err);
+    return null;
+  }
+}
+
 // Optional per-event blog post. Never generated from photos alone — the
 // client's own notes are the substance; approved captions/scores just add
 // grounded detail about specific moments so it doesn't read as filler.

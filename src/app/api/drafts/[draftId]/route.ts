@@ -20,6 +20,22 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ dr
   }
 
   const body = await request.json();
+
+  // Save-as-draft: park an in-progress edit without resolving the draft, so
+  // backing out of the review feed mid-sentence doesn't lose the work. Stays
+  // "pending", doesn't skip sibling options, doesn't touch the approval
+  // streak — none of which should move until the client actually decides.
+  if (body.saveOnly === true) {
+    if (typeof body.editedCaption !== "string") {
+      return NextResponse.json({ error: "editedCaption required" }, { status: 400 });
+    }
+    const saved = await prisma.draft.update({
+      where: { id: draftId },
+      data: { editedCaption: body.editedCaption },
+    });
+    return NextResponse.json({ ...saved, savedOnly: true });
+  }
+
   const status = typeof body.status === "string" && STATUSES.includes(body.status) ? body.status : null;
   if (!status) {
     return NextResponse.json({ error: "status must be one of approved, edited, skipped" }, { status: 400 });

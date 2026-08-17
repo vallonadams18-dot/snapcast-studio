@@ -10,6 +10,9 @@ type DraftItem = {
   platform: string;
   variantIndex: number;
   generatedCaption: string;
+  // A parked edit from a previous session (Save in edit mode). Reopening
+  // the editor picks this up instead of the AI's original text.
+  editedCaption: string | null;
   mediaUrl: string;
   mediaType: string;
   energyScore: number | null;
@@ -58,6 +61,14 @@ interface DraftCardProps {
   copiedId: string | null;
   onCopy: (text: string, id: string) => void;
   isExiting: boolean;
+  modifyingId: string | null;
+  modifyText: string;
+  onModifyTextChange: (v: string) => void;
+  onStartModify: (id: string) => void;
+  onCancelModify: () => void;
+  onSubmitModify: (id: string) => void;
+  onSaveDraft: (id: string, text: string) => void;
+  savedDraftId: string | null;
 }
 
 function DraftCard({
@@ -75,6 +86,14 @@ function DraftCard({
   copiedId,
   onCopy,
   isExiting,
+  modifyingId,
+  modifyText,
+  onModifyTextChange,
+  onStartModify,
+  onCancelModify,
+  onSubmitModify,
+  onSaveDraft,
+  savedDraftId,
 }: DraftCardProps) {
   const draft = group.variants[Math.min(selectedVariant, group.variants.length - 1)];
   const isEditing = editingId === draft.id;
@@ -104,14 +123,51 @@ function DraftCard({
           <span className="inline-block rounded-lg bg-primary-pink/10 px-3 py-1 text-xs font-medium text-primary-pink">
             {PLATFORM_LABELS[draft.platform] ?? draft.platform} caption
           </span>
-          <button
-            onClick={() => onRegenerate(draft.id)}
-            disabled={regenerating}
-            className="tap-scale flex min-h-11 items-center px-1 text-xs text-neutral-500 underline disabled:opacity-50"
-          >
-            {regenerating ? "Regenerating…" : "Regenerate"}
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => onStartModify(draft.id)}
+              disabled={regenerating}
+              className="tap-scale flex min-h-11 items-center px-1 text-xs text-neutral-500 underline disabled:opacity-50"
+            >
+              Modify
+            </button>
+            <button
+              onClick={() => onRegenerate(draft.id)}
+              disabled={regenerating}
+              className="tap-scale flex min-h-11 items-center px-1 text-xs text-neutral-500 underline disabled:opacity-50"
+            >
+              {regenerating ? "Regenerating…" : "Regenerate"}
+            </button>
+          </div>
         </div>
+
+        {modifyingId === draft.id && (
+          <div className="mb-3 rounded-lg border border-primary-pink/30 bg-primary-pink/5 p-3">
+            <p className="mb-2 text-xs font-medium text-foreground">What should change?</p>
+            <textarea
+              value={modifyText}
+              onChange={(e) => onModifyTextChange(e.target.value)}
+              rows={2}
+              placeholder="e.g. make it shorter, mention the venue, less formal"
+              className="w-full rounded-lg border border-border bg-background p-2 text-sm text-foreground focus:border-primary-pink focus:outline-none"
+            />
+            <div className="mt-2 flex gap-2">
+              <Button
+                onClick={() => onSubmitModify(draft.id)}
+                disabled={regenerating || !modifyText.trim()}
+                className="min-h-11 flex-1 text-xs"
+              >
+                {regenerating ? "Rewriting…" : "Rewrite it"}
+              </Button>
+              <Button variant="secondary" onClick={onCancelModify} className="min-h-11 text-xs">
+                Cancel
+              </Button>
+            </div>
+            <p className="mt-1 text-[10px] text-neutral-500">
+              Unlike Regenerate, this keeps the current caption and changes only what you ask for.
+            </p>
+          </div>
+        )}
 
         {group.variants.length > 1 && (
           <div className="mb-2 flex gap-1.5">
@@ -139,7 +195,16 @@ function DraftCard({
             className="mt-2 w-full min-h-11 rounded-lg border border-border bg-background p-3 text-sm text-foreground focus:border-primary-pink focus:outline-none"
           />
         ) : (
-          <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">{draft.generatedCaption}</p>
+          <>
+            {draft.editedCaption && (
+              <p className="mt-2 text-[10px] font-medium text-primary-pink">
+                You have an unfinished edit saved — tap Edit to pick it back up.
+              </p>
+            )}
+            <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">
+              {draft.editedCaption ?? draft.generatedCaption}
+            </p>
+          </>
         )}
 
         {isEditing ? (
@@ -151,10 +216,16 @@ function DraftCard({
               <span className="text-center text-[10px] leading-tight text-neutral-500">Post with your edits</span>
             </div>
             <div className="flex flex-col items-center gap-1">
+              <Button variant="secondary" onClick={() => onSaveDraft(draft.id, editText)} className="min-h-11">
+                {savedDraftId === draft.id ? "Saved" : "Save"}
+              </Button>
+              <span className="text-center text-[10px] leading-tight text-neutral-500">Keep for later</span>
+            </div>
+            <div className="flex flex-col items-center gap-1">
               <Button variant="secondary" onClick={onCancelEdit} className="min-h-11">
                 Cancel
               </Button>
-              <span className="text-center text-[10px] leading-tight text-neutral-500">Keep the original</span>
+              <span className="text-center text-[10px] leading-tight text-neutral-500">Discard changes</span>
             </div>
           </div>
         ) : (
@@ -201,6 +272,9 @@ export function ReviewFeed({ initialDrafts, eventId }: { initialDrafts: DraftIte
   const [error, setError] = useState<string | null>(null);
   const [trustModeOffer, setTrustModeOffer] = useState(false);
   const [trustModeEnabled, setTrustModeEnabled] = useState(false);
+  const [modifyingId, setModifyingId] = useState<string | null>(null);
+  const [modifyText, setModifyText] = useState("");
+  const [savedDraftId, setSavedDraftId] = useState<string | null>(null);
 
   // Group by (mediaId, platform) so multiple caption options for the same
   // photo/platform show as one card with a variant switcher, not separate
@@ -277,6 +351,50 @@ export function ReviewFeed({ initialDrafts, eventId }: { initialDrafts: DraftIte
     setRegenerating(false);
   }
 
+  // Modify: unlike Regenerate (a blind re-roll), this sends the client's own
+  // instruction and rewrites the existing caption around it.
+  async function submitModify(id: string) {
+    const guidance = modifyText.trim();
+    if (!guidance) return;
+
+    setRegenerating(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/drafts/${id}/revise`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ guidance }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error ?? "Couldn't rewrite that caption.");
+
+      setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, generatedCaption: body.generatedCaption } : d)));
+      setModifyingId(null);
+      setModifyText("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't rewrite that caption.");
+    }
+    setRegenerating(false);
+  }
+
+  // Save-as-draft: park the in-progress edit without approving, so leaving
+  // the page mid-sentence doesn't lose it.
+  async function saveDraft(id: string, text: string) {
+    setError(null);
+    try {
+      const response = await fetch(`/api/drafts/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ saveOnly: true, editedCaption: text }),
+      });
+      if (!response.ok) throw new Error();
+      setSavedDraftId(id);
+      setTimeout(() => setSavedDraftId(null), 2000);
+    } catch {
+      setError("Couldn't save your draft — check your connection and try again.");
+    }
+  }
+
   async function copyCaption(text: string, id: string) {
     await navigator.clipboard.writeText(text);
     setCopiedId(id);
@@ -332,7 +450,7 @@ export function ReviewFeed({ initialDrafts, eventId }: { initialDrafts: DraftIte
       onEditTextChange: setEditText,
       onStartEdit: (draft: DraftItem) => {
         setEditingId(draft.id);
-        setEditText(draft.generatedCaption);
+        setEditText(draft.editedCaption ?? draft.generatedCaption);
       },
       onCancelEdit: () => setEditingId(null),
       onUpdateStatus: (id: string, status: "approved" | "edited" | "skipped", editedCaption?: string) =>
@@ -342,6 +460,20 @@ export function ReviewFeed({ initialDrafts, eventId }: { initialDrafts: DraftIte
       copiedId,
       onCopy: copyCaption,
       isExiting: exitingKeys.has(group.key),
+      modifyingId,
+      modifyText,
+      onModifyTextChange: setModifyText,
+      onStartModify: (id: string) => {
+        setModifyingId(id);
+        setModifyText("");
+      },
+      onCancelModify: () => {
+        setModifyingId(null);
+        setModifyText("");
+      },
+      onSubmitModify: submitModify,
+      onSaveDraft: saveDraft,
+      savedDraftId,
     };
   }
 

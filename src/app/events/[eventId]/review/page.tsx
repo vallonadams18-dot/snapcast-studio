@@ -37,6 +37,7 @@ export default async function ReviewPage({ params }: { params: Promise<{ eventId
           platform: d.platform,
           variantIndex: d.variantIndex,
           generatedCaption: d.generatedCaption,
+          editedCaption: d.editedCaption,
           mediaUrl: d.media.sourceUrl,
           mediaType: d.media.mediaType,
           energyScore: d.media.energyScore,
