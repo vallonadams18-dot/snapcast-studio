@@ -14,6 +14,7 @@ import { analyzeClip, PLATFORMS } from "@/lib/ai";
 import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
 import { isFeatureEnabled } from "@/lib/featureFlags";
+import { addBrandBookends, applyWatermark } from "@/lib/branding";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
@@ -77,10 +78,33 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
 
     let montageBuffer = await readFile(montagePath);
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
-    const totalDuration = montageDurationSeconds(selected.length, style);
+    let totalDuration = montageDurationSeconds(selected.length, style);
+
+    // Bookends go on BEFORE the music so the track plays across the logo
+    // cards too, rather than starting abruptly after the intro.
+    const branded = await addBrandBookends(
+      montageBuffer,
+      { logoUrl: account.brandLogoUrl, brandColorsJson: account.brandColors, businessName: account.businessName },
+      { intro: account.introEnabled, outro: account.outroEnabled, outroText: account.outroText },
+    );
+    if (branded) {
+      montageBuffer = branded;
+      // The music trim has to cover the added cards or the tail runs silent.
+      totalDuration += (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0);
+    }
 
     const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration);
     if (mixed) montageBuffer = mixed;
+
+    if (account.watermarkEnabled) {
+      const marked = await applyWatermark(
+        montageBuffer,
+        { logoUrl: account.brandLogoUrl, brandColorsJson: account.brandColors, businessName: account.businessName },
+        { position: account.watermarkPosition, opacity: account.watermarkOpacity },
+        "video",
+      );
+      if (marked) montageBuffer = marked;
+    }
 
     // First (best-scored) photo doubles as the representative frame for
     // caption/score generation — no separate frame extraction needed.

@@ -12,6 +12,7 @@ import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { mixTrackIntoClip } from "@/lib/music";
 import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
+import { addBrandBookends, applyWatermark } from "@/lib/branding";
 import { isFeatureEnabled } from "@/lib/featureFlags";
 import { resolveFfmpegPath } from "@/lib/ffmpegPaths";
 import { spawn } from "node:child_process";
@@ -78,13 +79,40 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
 
     let clipBuffer = await readFile(clipPath);
     const suggestedTrack = suggestTrackForEventType(media.event.eventType).id;
-    const clipDuration = window.endSeconds - window.startSeconds;
+    let clipDuration = window.endSeconds - window.startSeconds;
+
+    const brandAssets = {
+      logoUrl: account.brandLogoUrl,
+      brandColorsJson: account.brandColors,
+      businessName: account.businessName,
+    };
+
+    // Bookends before music, so the track carries across the logo cards.
+    const branded = await addBrandBookends(clipBuffer, brandAssets, {
+      intro: account.introEnabled,
+      outro: account.outroEnabled,
+      outroText: account.outroText,
+    });
+    if (branded) {
+      clipBuffer = branded;
+      clipDuration += (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0);
+    }
 
     // If a licensed library is connected, mix real audio in immediately
     // rather than leaving the first cut silent-of-music until someone
     // manually swaps the track.
     const mixed = await mixTrackIntoClip(clipBuffer, suggestedTrack, clipDuration);
     if (mixed) clipBuffer = mixed;
+
+    if (account.watermarkEnabled) {
+      const marked = await applyWatermark(
+        clipBuffer,
+        brandAssets,
+        { position: account.watermarkPosition, opacity: account.watermarkOpacity },
+        "video",
+      );
+      if (marked) clipBuffer = marked;
+    }
 
     const key = randomFileKey(media.eventId, `clip-${media.id}.mp4`);
     const saved = await getStorageAdapter().save(key, clipBuffer, "video/mp4");

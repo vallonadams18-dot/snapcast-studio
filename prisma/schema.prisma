@@ -53,6 +53,22 @@ model Account {
   // browse and claim/share photos, auto-tagging the business.
   guestPortalEnabled Boolean @default(false)
 
+  // Branded bookends on generated videos. Both need brandLogoUrl set —
+  // without a logo there's nothing to show, so the render skips them.
+  introEnabled Boolean @default(false)
+  outroEnabled Boolean @default(false)
+  // Shown under the logo on the outro card, e.g. "Book your next event
+  // @mirrormebk". Empty falls back to the business name.
+  outroText    String?
+
+  // Persistent logo watermark burned into generated videos and photos.
+  watermarkEnabled  Boolean @default(false)
+  // bottom-right | bottom-left | top-right | top-left
+  watermarkPosition String  @default("bottom-right")
+  // 0.0–1.0. Default is deliberately semi-transparent: a full-opacity logo
+  // over someone's face is worse than no watermark.
+  watermarkOpacity  Float   @default(0.65)
+
   sessions      Session[]
   events        Event[]
   guestClaims   GuestClaim[]

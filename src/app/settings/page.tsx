@@ -4,6 +4,7 @@ import { getCurrentAccount } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { WebhookInfo } from "../WebhookInfo";
 import { GuestPortalToggle } from "../GuestPortalToggle";
+import { BrandingPanel } from "../BrandingPanel";
 
 export default async function SettingsPage() {
   const account = await getCurrentAccount();
@@ -25,6 +26,15 @@ export default async function SettingsPage() {
         One-time setup for how content reaches Snapcast Studio and how guests can share it.
       </p>
 
+      <BrandingPanel
+        brandLogoUrl={account.brandLogoUrl}
+        introEnabled={account.introEnabled}
+        outroEnabled={account.outroEnabled}
+        outroText={account.outroText}
+        watermarkEnabled={account.watermarkEnabled}
+        watermarkPosition={account.watermarkPosition}
+        watermarkOpacity={account.watermarkOpacity}
+      />
       <GuestPortalToggle initialEnabled={account.guestPortalEnabled} claimCount={claimCount} />
       <WebhookInfo webhookUrl={webhookUrl} secret={account.webhookSecret} />
     </div>

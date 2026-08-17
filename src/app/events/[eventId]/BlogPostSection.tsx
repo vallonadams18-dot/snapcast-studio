@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Button } from "@/components/ui";
 import { ErrorState } from "@/components/States";
+import { VoiceNotesInput } from "./VoiceNotesInput";
 
 type BlogPost = {
   status: string;
@@ -74,6 +75,7 @@ export function BlogPostSection({ eventId, initialPost }: { eventId: string; ini
                 placeholder="e.g. Sarah and Jake's rooftop wedding, 120 guests, surprise fireworks finale, the best man's speech had everyone in tears..."
                 className="w-full rounded-lg border border-border bg-background p-3 text-sm text-foreground focus:border-primary-pink focus:outline-none"
               />
+              <VoiceNotesInput value={notes} onChange={setNotes} disabled={loading} />
               {error && (
                 <div className="mt-2">
                   <ErrorState message={error} onRetry={generate} />
