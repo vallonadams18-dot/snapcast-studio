@@ -50,9 +50,14 @@ chown snapcast:snapcast .env && chmod 600 .env
 ## 4. First deploy
 
 ```
-chown -R snapcast:snapcast /srv/snapcast
-sudo -u snapcast bash deploy/deploy.sh
+chown -R snapcast:snapcast /srv/snapcast /var/lib/snapcast
+bash deploy/deploy.sh
 ```
+
+Run this **as root** — it drops to the `snapcast` user for the build steps
+itself, then uses root for `systemctl restart`. Don't run it via
+`sudo -u snapcast`: that account is a `--system` user with no password, so any
+`sudo` inside it hangs on a prompt it can never answer.
 
 ## 5. Run as a service
 
