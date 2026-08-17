@@ -27,8 +27,21 @@ const EPIDEMIC_SEARCH: Record<string, { term: string; mood?: string; genre?: str
 
 const EPIDEMIC_API_BASE = "https://partner-content-api.epidemicsound.com/v0";
 
+// Same guard as lib/ai.ts: a masked key (the "epidemic_live_••••" form sites
+// show when hiding a secret) contains U+2022 bullets, which can't go in an
+// HTTP header. Without this the request dies inside fetch with an opaque
+// ByteString error and clips silently fall back to no music.
 function getEpidemicApiKey(): string | null {
-  return process.env.EPIDEMIC_SOUND_API_KEY || null;
+  const key = process.env.EPIDEMIC_SOUND_API_KEY;
+  if (!key) return null;
+  if (!/^[\x20-\x7E]+$/.test(key)) {
+    console.error(
+      "[music] EPIDEMIC_SOUND_API_KEY contains non-ASCII characters and cannot be used. " +
+        "This usually means a masked version of the key was copied instead of the real one.",
+    );
+    return null;
+  }
+  return key;
 }
 
 interface EpidemicSearchResult {

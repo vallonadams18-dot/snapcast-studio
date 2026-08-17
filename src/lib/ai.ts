@@ -22,9 +22,36 @@ export interface AnalysisResult {
 
 let client: Anthropic | null | undefined;
 
+// A key is only usable if it can go in an HTTP header — i.e. pure ASCII.
+// The failure this guards against: pasting a *masked* key (the "sk-ant-a••••"
+// form a site shows when hiding a secret) puts U+2022 bullets in the value.
+// The client constructs fine, then every request dies deep in the fetch layer
+// with "Cannot convert argument to a ByteString", which surfaces to users as
+// nothing more than placeholder captions and 50/50/50 scores.
+function keyLooksUsable(key: string): boolean {
+  return /^[\x20-\x7E]+$/.test(key);
+}
+
 export function getAnthropicClient(): Anthropic | null {
   if (client !== undefined) return client;
-  client = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    console.warn("[ai] ANTHROPIC_API_KEY is not set — captions and scores will be placeholders.");
+    client = null;
+    return client;
+  }
+  if (!keyLooksUsable(key)) {
+    console.error(
+      "[ai] ANTHROPIC_API_KEY contains non-ASCII characters and cannot be used. " +
+        "This usually means a masked/obscured version of the key was copied " +
+        "instead of the real one. Captions and scores will be placeholders.",
+    );
+    client = null;
+    return client;
+  }
+
+  client = new Anthropic();
   return client;
 }
 
