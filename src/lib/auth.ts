@@ -1,9 +1,26 @@
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { prisma } from "@/lib/prisma";
 
 const SESSION_COOKIE = "snapcast_session";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// A `Secure` cookie is silently DISCARDED by the browser when the page is
+// served over plain http — the login "succeeds", the session row is written,
+// and the user lands back on the login screen with no error to explain it.
+//
+// So key this off the request's actual protocol rather than NODE_ENV: a
+// production box on http (no domain/cert yet) still works, and the flag
+// turns itself on the moment HTTPS is put in front, with nothing to
+// remember to flip. nginx supplies x-forwarded-proto (see
+// deploy/nginx-snapcast.conf).
+async function isHttpsRequest(): Promise<boolean> {
+  const headerList = await headers();
+  const proto = headerList.get("x-forwarded-proto");
+  if (proto) return proto.split(",")[0].trim() === "https";
+  // No proxy header — only trust NODE_ENV if we're plausibly behind one.
+  return process.env.NODE_ENV === "production" && process.env.ASSUME_HTTPS === "true";
+}
 
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString("hex");
@@ -30,7 +47,7 @@ export async function createSession(accountId: string, impersonatedByAccountId?:
   store.set(SESSION_COOKIE, session.id, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: await isHttpsRequest(),
     path: "/",
     expires: session.expiresAt,
   });
