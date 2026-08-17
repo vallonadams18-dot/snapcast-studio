@@ -1,4 +1,5 @@
 import { redirect, notFound } from "next/navigation";
+import Link from "next/link";
 import { headers } from "next/headers";
 import { getCurrentAccount } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -53,9 +54,9 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
 
   return (
     <div className="mx-auto w-full max-w-2xl p-6 lg:max-w-4xl">
-      <a href="/" className="tap-scale inline-flex min-h-11 items-center text-sm text-neutral-500 underline">
+      <Link href="/" className="tap-scale inline-flex min-h-11 items-center text-sm text-neutral-500 underline">
         ← All events
-      </a>
+      </Link>
       <h1 className="mb-1 mt-2 text-2xl font-bold text-foreground">{event.name}</h1>
       <p className="mb-6 text-sm capitalize text-neutral-500">{event.eventType} event</p>
 

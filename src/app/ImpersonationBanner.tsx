@@ -8,6 +8,12 @@ export function ImpersonationBanner({ clientName }: { clientName: string }) {
   async function returnToAdmin() {
     setReturning(true);
     await fetch("/api/admin/return-to-admin", { method: "POST" });
+    // Deliberately a full page load, not router.push(). This swaps which
+    // account the session belongs to, and router navigation keeps the
+    // existing React tree — any client component still holding the
+    // impersonated client's data would survive the transition. A hard
+    // reload guarantees nothing from that identity is left in memory.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = "/admin";
   }
 

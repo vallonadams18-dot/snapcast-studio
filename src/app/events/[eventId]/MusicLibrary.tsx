@@ -57,7 +57,9 @@ export function MusicLibrary({
   const [query, setQuery] = useState("");
   const [tracks, setTracks] = useState<LibraryTrack[]>([]);
   const [saved, setSaved] = useState<SavedTrack[]>([]);
-  const [loading, setLoading] = useState(false);
+  // Starts true: the sheet kicks off a search on mount, so rendering
+  // "not loading" for the first frame would flash an empty-results message.
+  const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<LibraryTrack | null>(null);
   const [startSeconds, setStartSeconds] = useState(0);
   const [peaks, setPeaks] = useState<number[]>([]);
@@ -82,13 +84,37 @@ export function MusicLibrary({
     setLoading(false);
   }, []);
 
+  // Both calls await before touching state, so nothing is set synchronously
+  // during the effect — a sync setState here would cascade an extra render
+  // on every mount of the sheet.
   useEffect(() => {
-    search("event celebration");
-    fetch("/api/music/saved")
-      .then((r) => r.json())
-      .then((b) => setSaved(b.saved ?? []))
-      .catch(() => {});
-  }, [search]);
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const [searchRes, savedRes] = await Promise.all([
+          fetch(`/api/music/search?q=${encodeURIComponent("event celebration")}`),
+          fetch("/api/music/saved"),
+        ]);
+        if (cancelled) return;
+
+        const searchBody = await searchRes.json().catch(() => ({}));
+        if (!cancelled && searchRes.ok) setTracks(searchBody.tracks ?? []);
+        else if (!cancelled) setError(searchBody.error ?? "Couldn't load the music library.");
+
+        const savedBody = await savedRes.json().catch(() => ({}));
+        if (!cancelled && savedRes.ok) setSaved(savedBody.saved ?? []);
+      } catch {
+        if (!cancelled) setError("Couldn't reach the music library. Check your connection.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Stop audio when the sheet closes — otherwise the preview keeps playing
   // over the rest of the app.

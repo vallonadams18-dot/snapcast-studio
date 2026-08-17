@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Button, Input } from "@/components/ui";
+import { Input } from "@/components/ui";
 import { SuccessBanner } from "@/components/States";
 
 const POSITIONS = [

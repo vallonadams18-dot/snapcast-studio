@@ -9,6 +9,11 @@ export function ImpersonateButton({ accountId }: { accountId: string }) {
     setLoading(true);
     const response = await fetch(`/api/admin/clients/${accountId}/impersonate`, { method: "POST" });
     if (response.ok) {
+      // Deliberately a full page load, not router.push(). This swaps the
+      // session to a different account, and router navigation preserves the
+      // React tree — admin-side state could otherwise linger into the
+      // impersonated view. A hard reload starts the client clean.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
       window.location.href = "/";
     } else {
       setLoading(false);

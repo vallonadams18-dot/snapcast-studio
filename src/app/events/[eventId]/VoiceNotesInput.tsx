@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 // Minimal shape of the Web Speech API we use. It isn't in TypeScript's DOM
 // lib because it's still vendor-prefixed in most browsers.
@@ -47,7 +47,15 @@ export function VoiceNotesInput({
   onChange: (next: string) => void;
   disabled?: boolean;
 }) {
-  const [supported, setSupported] = useState(false);
+  // Whether the browser has a speech recognizer is external, non-reactive
+  // state. useSyncExternalStore reads it correctly on both sides of
+  // hydration — the server snapshot is false, so SSR renders the typing
+  // hint and the client swaps in the button without a mismatch warning.
+  const supported = useSyncExternalStore(
+    () => () => {},
+    () => getRecognitionCtor() !== null,
+    () => false,
+  );
   const [listening, setListening] = useState(false);
   const [interim, setInterim] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -56,10 +64,6 @@ export function VoiceNotesInput({
   // Kept in a ref so the recognition callbacks always append to the latest
   // text rather than whatever `value` was when the listener was attached.
   const baseTextRef = useRef(value);
-
-  useEffect(() => {
-    setSupported(getRecognitionCtor() !== null);
-  }, []);
 
   useEffect(() => {
     return () => {
