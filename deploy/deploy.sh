@@ -39,17 +39,43 @@ run_as_app "npm install"
 echo "==> Generating Prisma client"
 run_as_app "npx prisma generate"
 
-echo "==> Applying database migrations"
-# deploy (not dev) — applies pending migrations without ever prompting to
-# reset, so a schema change can't silently wipe production data.
-run_as_app "npx prisma migrate deploy"
-
+# Build BEFORE touching the database: it's the slow step and needs no DB
+# access, so doing it while the old version is still serving keeps downtime
+# to just the migration below.
 echo "==> Building"
 run_as_app "npm run build"
 
-echo "==> Restarting service"
+SERVICE_INSTALLED=false
 if systemctl list-unit-files snapcast.service >/dev/null 2>&1; then
-  systemctl restart snapcast
+  SERVICE_INSTALLED=true
+fi
+
+# SQLite allows only one writer, and the running app holds the file open.
+# `prisma migrate deploy` needs an exclusive lock to write _prisma_migrations
+# and fails with "database is locked" if the service is still up. Stop it for
+# the migration, then bring it back on the new build.
+if [ "$SERVICE_INSTALLED" = true ]; then
+  echo "==> Stopping service for migration"
+  systemctl stop snapcast
+fi
+
+echo "==> Applying database migrations"
+# deploy (not dev) — applies pending migrations without ever prompting to
+# reset, so a schema change can't silently wipe production data.
+if ! run_as_app "npx prisma migrate deploy"; then
+  echo "ERROR: migration failed." >&2
+  # Don't leave the site down because a migration failed — the previous
+  # build is still on disk and will serve fine against the un-migrated DB.
+  if [ "$SERVICE_INSTALLED" = true ]; then
+    echo "     Restarting service so the site stays up." >&2
+    systemctl start snapcast || true
+  fi
+  exit 1
+fi
+
+if [ "$SERVICE_INSTALLED" = true ]; then
+  echo "==> Starting service"
+  systemctl start snapcast
   sleep 2
   systemctl --no-pager status snapcast | head -12
 else
