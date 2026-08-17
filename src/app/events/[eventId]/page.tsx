@@ -9,7 +9,29 @@ import { VideoClipButton } from "./VideoClipButton";
 import { MusicPicker } from "./MusicPicker";
 import { BlogPostSection } from "./BlogPostSection";
 import { PhotoMontageButton } from "./PhotoMontageButton";
-import { suggestStyleForEventType } from "@/lib/montageStyles";
+import { suggestStyleForEventType, getMontageStyle } from "@/lib/montageStyles";
+
+// How long a generated video runs — the music picker needs this to show the
+// right selection window on the waveform. Clips carry an explicit range;
+// montages are derived from photo count and the style's pacing.
+function mediaDurationSeconds(m: {
+  clipStartSeconds: number | null;
+  clipEndSeconds: number | null;
+  compiledFromMediaIds: string | null;
+}): number {
+  if (m.clipStartSeconds !== null && m.clipEndSeconds !== null) {
+    return m.clipEndSeconds - m.clipStartSeconds;
+  }
+  if (m.compiledFromMediaIds) {
+    try {
+      const ids = JSON.parse(m.compiledFromMediaIds) as string[];
+      return ids.length * getMontageStyle(null).secondsPerPhoto;
+    } catch {
+      return 15;
+    }
+  }
+  return 15;
+}
 
 export default async function EventPage({ params }: { params: Promise<{ eventId: string }> }) {
   const account = await getCurrentAccount();
@@ -91,7 +113,12 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
                     {m.compiledFromMediaIds ? "Photo video" : "Clip"}
                   </span>
                   <div className="absolute inset-x-0 bottom-0 p-1">
-                    <MusicPicker mediaId={m.id} currentTrackId={m.musicTrack} />
+                    <MusicPicker
+                      mediaId={m.id}
+                      currentTrackId={m.musicTrack}
+                      currentTrackTitle={m.musicTrackTitle}
+                      clipDurationSeconds={mediaDurationSeconds(m)}
+                    />
                   </div>
                 </>
               )}

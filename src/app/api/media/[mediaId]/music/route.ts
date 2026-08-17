@@ -6,7 +6,7 @@ import { mixTrackIntoClip } from "@/lib/music";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
 import { rateLimit } from "@/lib/rateLimit";
-import { DEFAULT_MONTAGE_SECONDS_PER_PHOTO } from "@/lib/video";
+import { getMontageStyle } from "@/lib/montageStyles";
 
 // A clip has an explicit time range; a photo montage doesn't, so its
 // duration is derived from how many source photos it was compiled from.
@@ -21,7 +21,7 @@ function resolveVideoDuration(media: {
   if (media.compiledFromMediaIds) {
     try {
       const ids = JSON.parse(media.compiledFromMediaIds) as string[];
-      return ids.length * DEFAULT_MONTAGE_SECONDS_PER_PHOTO;
+      return ids.length * getMontageStyle(null).secondsPerPhoto;
     } catch {
       return null;
     }
@@ -38,8 +38,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
   if (!media) return NextResponse.json({ error: "not found" }, { status: 404 });
 
   const body = await request.json();
+
+  // Two ways to set music:
+  //  - trackId: a broad catalog category (the quick-swap chips)
+  //  - libraryTrackId: a specific Epidemic track the client picked from the
+  //    library, optionally with a start point they dragged on the waveform
   const trackId = typeof body.trackId === "string" ? body.trackId : null;
-  if (!trackId || !getTrackById(trackId)) {
+  const libraryTrackId = typeof body.libraryTrackId === "string" ? body.libraryTrackId : null;
+  const libraryTrackTitle = typeof body.libraryTrackTitle === "string" ? body.libraryTrackTitle : null;
+  const startSeconds = typeof body.startSeconds === "number" && body.startSeconds >= 0 ? body.startSeconds : null;
+
+  if (!libraryTrackId && (!trackId || !getTrackById(trackId))) {
     return NextResponse.json({ error: "unknown track" }, { status: 400 });
   }
 
@@ -56,15 +65,25 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
   // (clip or photo montage) and a licensed library is connected —
   // otherwise this just tags the choice, same as before.
   const duration = resolveVideoDuration(media);
+  let mixed = false;
   if (duration !== null) {
     try {
       const original = await getMediaBytes(media);
-      const mixed = await mixTrackIntoClip(original, trackId, duration);
-      if (mixed) {
-        const key = randomFileKey(media.eventId, `clip-${media.id}-${trackId}.mp4`);
-        const saved = await getStorageAdapter().save(key, mixed, "video/mp4");
+      const result = await mixTrackIntoClip(
+        original,
+        trackId ?? media.musicTrack ?? "cinematic",
+        duration,
+        libraryTrackId,
+        startSeconds,
+      );
+      if (result) {
+        // Cache-bust on the filename: the browser has the old mix cached at
+        // the previous URL, and reusing it would play the old audio.
+        const key = randomFileKey(media.eventId, `clip-${media.id}-${Date.now()}.mp4`);
+        const saved = await getStorageAdapter().save(key, result, "video/mp4");
         storagePath = saved.storageRef;
         sourceUrl = saved.url;
+        mixed = true;
       }
     } catch (err) {
       console.error("[music] Track swap mix failed, keeping tag-only", err);
@@ -73,7 +92,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
 
   const updated = await prisma.media.update({
     where: { id: mediaId },
-    data: { musicTrack: trackId, storagePath, sourceUrl },
+    data: {
+      ...(trackId ? { musicTrack: trackId } : {}),
+      musicTrackId: libraryTrackId,
+      musicTrackTitle: libraryTrackTitle,
+      musicStartSeconds: startSeconds,
+      storagePath,
+      sourceUrl,
+    },
   });
-  return NextResponse.json({ musicTrack: updated.musicTrack, sourceUrl: updated.sourceUrl });
+
+  return NextResponse.json({
+    musicTrack: updated.musicTrack,
+    musicTrackId: updated.musicTrackId,
+    musicTrackTitle: updated.musicTrackTitle,
+    sourceUrl: updated.sourceUrl,
+    mixed,
+  });
 }

@@ -60,8 +60,30 @@ model Account {
   adminNotes    AdminNote[]
   checklist     OnboardingChecklistItem[]
   usageEvents   UsageEvent[]
+  savedTracks   SavedTrack[]
 
   createdAt DateTime @default(now())
+}
+
+// A track the client favorited in the music library, so they can reuse a
+// sound across events without searching for it again. Title/artist are
+// denormalized because the library is a remote API — this way the saved
+// list renders instantly without a round trip per track.
+model SavedTrack {
+  id        String  @id @default(cuid())
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+
+  trackId     String
+  title       String
+  artist      String?
+  lengthSeconds Int?
+  waveformUrl String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([accountId, trackId])
+  @@index([accountId, createdAt])
 }
 
 model Session {
@@ -202,6 +224,14 @@ model Media {
   clipEndSeconds   Float?
   // Track name/id from the music catalog chosen for this clip, if any.
   musicTrack       String?
+  // A specific Epidemic Sound track the client picked from the library,
+  // which overrides the broad `musicTrack` category above. Kept separate so
+  // an unpicked clip still falls back to the event-type suggestion.
+  musicTrackId     String?
+  musicTrackTitle  String?
+  // Where in the track to start. Null = let the app choose (track start).
+  // Set when the client drags the start handle on the waveform.
+  musicStartSeconds Float?
   // JSON array of source Media ids, set when this row is a photo-montage
   // video compiled from several photos rather than cut from one video.
   compiledFromMediaIds String?

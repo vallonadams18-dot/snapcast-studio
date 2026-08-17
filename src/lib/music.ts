@@ -49,6 +49,75 @@ interface EpidemicSearchResult {
   title: string;
 }
 
+// What the browser needs to render a track row in the library picker.
+export interface LibraryTrack {
+  id: string;
+  title: string;
+  artist: string;
+  bpm: number | null;
+  lengthSeconds: number;
+  moods: string[];
+  genres: string[];
+  waveformUrl: string | null;
+}
+
+interface RawTrack {
+  id: string;
+  title: string;
+  mainArtists?: string[];
+  bpm?: number;
+  length?: number;
+  moods?: { name: string }[];
+  genres?: { name: string }[];
+  waveformUrl?: string;
+}
+
+function toLibraryTrack(t: RawTrack): LibraryTrack {
+  return {
+    id: t.id,
+    title: t.title,
+    artist: t.mainArtists?.join(", ") ?? "Unknown artist",
+    bpm: t.bpm ?? null,
+    lengthSeconds: t.length ?? 0,
+    moods: (t.moods ?? []).map((m) => m.name),
+    genres: (t.genres ?? []).map((g) => g.name),
+    waveformUrl: t.waveformUrl ?? null,
+  };
+}
+
+// Free-text search across the licensed catalog, for the browse-and-pick UI.
+export async function searchLibrary(term: string, limit = 24): Promise<LibraryTrack[]> {
+  const apiKey = getEpidemicApiKey();
+  if (!apiKey) return [];
+
+  const params = new URLSearchParams({ term: term || "event", limit: String(Math.min(limit, 60)) });
+  const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+  });
+  if (!response.ok) {
+    console.error("[music] library search failed", response.status);
+    return [];
+  }
+  const data = (await response.json()) as { tracks: RawTrack[] };
+  return (data.tracks ?? []).map(toLibraryTrack);
+}
+
+// Resolves a track's licensed MP3 URL. Used by the preview proxy so the API
+// key never reaches the browser.
+export async function getTrackAudioUrl(trackId: string): Promise<string | null> {
+  const apiKey = getEpidemicApiKey();
+  if (!apiKey) return null;
+  const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/${trackId}/download?quality=normal`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+  });
+  if (!response.ok) {
+    console.error("[music] preview link failed", trackId, response.status);
+    return null;
+  }
+  const { url } = (await response.json()) as { url: string };
+  return url;
+}
+
 async function runEpidemicSearch(apiKey: string, params: URLSearchParams): Promise<EpidemicSearchResult | null> {
   const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -120,21 +189,31 @@ export async function mixTrackIntoClip(
   clipVideoBuffer: Buffer,
   catalogId: string,
   clipDurationSeconds: number,
+  // When set, use this exact Epidemic track instead of searching the broad
+  // catalog category — this is the client's own pick from the library.
+  explicitTrackId?: string | null,
+  // Where in the track to start, in seconds. Lets the client choose the
+  // drop/chorus rather than always getting the intro.
+  startSeconds?: number | null,
   // NonSharedBuffer (what fs.readFile returns) rather than plain Buffer, so
   // callers can reassign the result onto a readFile-derived variable.
 ): Promise<Buffer<ArrayBuffer> | null> {
   const apiKey = getEpidemicApiKey();
   if (!apiKey) return null;
 
-  const found = await searchEpidemicTrack(catalogId);
-  if (!found) {
-    console.error("[music] No Epidemic Sound match for catalog category", catalogId);
-    return null;
+  let trackId = explicitTrackId ?? null;
+  if (!trackId) {
+    const found = await searchEpidemicTrack(catalogId);
+    if (!found) {
+      console.error("[music] No Epidemic Sound match for catalog category", catalogId);
+      return null;
+    }
+    trackId = found.id;
   }
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-music-"));
   try {
-    const audioBuffer = await downloadEpidemicTrack(found.id);
+    const audioBuffer = await downloadEpidemicTrack(trackId);
     const audioPath = path.join(tmpDir, "track.mp3");
     await writeFile(audioPath, audioBuffer);
 
@@ -142,11 +221,18 @@ export async function mixTrackIntoClip(
     await writeFile(videoPath, clipVideoBuffer);
     const outputPath = path.join(tmpDir, "output.mp4");
 
+    // atrim works in absolute track time, so the window is start → start+len.
+    // asetpts rebases the trimmed audio to zero; without it the audio keeps
+    // its original timestamps and stays silent until that point in the track
+    // would have arrived.
+    const start = Math.max(0, startSeconds ?? 0);
+    const end = start + clipDurationSeconds;
     const fadeStart = Math.max(0, clipDurationSeconds - 1);
     await runFfmpeg([
       "-i", videoPath,
       "-i", audioPath,
-      "-filter_complex", `[1:a]atrim=0:${clipDurationSeconds},afade=t=out:st=${fadeStart}:d=1[aout]`,
+      "-filter_complex",
+      `[1:a]atrim=${start}:${end},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.4,afade=t=out:st=${fadeStart}:d=1[aout]`,
       "-map", "0:v",
       "-map", "[aout]",
       // Re-encode (not -c:v copy) and hard-cap with -t: some source videos
