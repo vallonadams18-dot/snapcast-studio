@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { prisma } from "@/lib/prisma";
@@ -53,7 +53,6 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
     // media.storagePath already; for S3/R2 we pull the bytes down first.
     let sourcePath = media.storagePath;
     if (media.storagePath.startsWith("http")) {
-      const { writeFile } = await import("node:fs/promises");
       sourcePath = path.join(tmpDir, "source.mp4");
       await writeFile(sourcePath, await getMediaBytes(media));
     }
@@ -79,7 +78,6 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
 
     let clipBuffer = await readFile(clipPath);
     const suggestedTrack = suggestTrackForEventType(media.event.eventType).id;
-    let clipDuration = window.endSeconds - window.startSeconds;
 
     const brandAssets = {
       logoUrl: account.brandLogoUrl,
@@ -93,10 +91,20 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
       outro: account.outroEnabled,
       outroText: account.outroText,
     });
-    if (branded) {
-      clipBuffer = branded;
-      clipDuration += (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0);
-    }
+    if (branded) clipBuffer = branded;
+
+    // Probe the real length of what we're about to score. The requested
+    // window and the rendered clip are not always the same — a window that
+    // runs past the end of the source is silently truncated — and the
+    // branded cards add their own time. Predicting from those inputs is how
+    // music ends up outlasting the picture.
+    const measuredPath = path.join(tmpDir, "measured.mp4");
+    await writeFile(measuredPath, clipBuffer);
+    const predictedDuration =
+      window.endSeconds -
+      window.startSeconds +
+      (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
+    const clipDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
     // If a licensed library is connected, mix real audio in immediately
     // rather than leaving the first cut silent-of-music until someone

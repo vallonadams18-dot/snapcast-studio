@@ -52,6 +52,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
     await trimVideo({ sourcePath, startSeconds, endSeconds: safeEnd, outputPath });
 
     const trimmed = await readFile(outputPath);
+
+    // Measure what actually came out. The requested range and the rendered
+    // file differ slightly — a re-encode lands on whole frames — and this
+    // value is what the music picker's selection window is drawn from, so a
+    // guess here shows the client the wrong slice of the track.
+    const requestedDuration = safeEnd - startSeconds;
+    const renderedDuration = await getVideoDurationSeconds(outputPath).catch(() => requestedDuration);
+
     // New filename so the browser can't serve the previous cut from cache.
     const key = randomFileKey(media.eventId, `edit-${media.id}-${Date.now()}.mp4`);
     const saved = await getStorageAdapter().save(key, trimmed, "video/mp4");
@@ -64,13 +72,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
         // Keep the stored range meaningful for anything that derives a
         // duration from it (the music picker's selection window does).
         clipStartSeconds: 0,
-        clipEndSeconds: safeEnd - startSeconds,
+        clipEndSeconds: renderedDuration,
       },
     });
 
     return NextResponse.json({
       sourceUrl: updated.sourceUrl,
-      durationSeconds: safeEnd - startSeconds,
+      durationSeconds: renderedDuration,
     });
   } catch (err) {
     console.error("[trim] failed", err);

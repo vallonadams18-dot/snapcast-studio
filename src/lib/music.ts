@@ -8,6 +8,8 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { resolveFfmpegPath } from "@/lib/ffmpegPaths";
+import { deliveryEncode } from "@/lib/encoding";
+import { pickHighEnergyStart } from "@/lib/audioEnergy";
 
 export { MUSIC_CATALOG, suggestTrackForEventType, getTrackById, type MusicTrack } from "@/lib/musicCatalog";
 
@@ -47,6 +49,11 @@ function getEpidemicApiKey(): string | null {
 interface EpidemicSearchResult {
   id: string;
   title: string;
+  // Carried through so a montage can start the track at a loud section
+  // rather than 0:00. Both come back on the same search response the picker
+  // already uses — they were simply being discarded here.
+  waveformUrl: string | null;
+  lengthSeconds: number | null;
 }
 
 // What the browser needs to render a track row in the library picker.
@@ -126,9 +133,15 @@ async function runEpidemicSearch(apiKey: string, params: URLSearchParams): Promi
     console.error("[music] Epidemic Sound search failed", response.status, await response.text().catch(() => ""));
     return null;
   }
-  const data = (await response.json()) as { tracks: { id: string; title: string }[] };
+  const data = (await response.json()) as { tracks: RawTrack[] };
   const track = data.tracks[0];
-  return track ? { id: track.id, title: track.title } : null;
+  if (!track) return null;
+  return {
+    id: track.id,
+    title: track.title,
+    waveformUrl: track.waveformUrl ?? null,
+    lengthSeconds: track.length ?? null,
+  };
 }
 
 async function searchEpidemicTrack(catalogId: string): Promise<EpidemicSearchResult | null> {
@@ -202,6 +215,9 @@ export async function mixTrackIntoClip(
   if (!apiKey) return null;
 
   let trackId = explicitTrackId ?? null;
+  let waveformUrl: string | null = null;
+  let trackLengthSeconds: number | null = null;
+
   if (!trackId) {
     const found = await searchEpidemicTrack(catalogId);
     if (!found) {
@@ -209,6 +225,8 @@ export async function mixTrackIntoClip(
       return null;
     }
     trackId = found.id;
+    waveformUrl = found.waveformUrl;
+    trackLengthSeconds = found.lengthSeconds;
   }
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-music-"));
@@ -221,11 +239,32 @@ export async function mixTrackIntoClip(
     await writeFile(videoPath, clipVideoBuffer);
     const outputPath = path.join(tmpDir, "output.mp4");
 
+    // Where in the track to begin.
+    //
+    // A caller-supplied value is ALWAYS honoured — that is the client having
+    // dragged the handle on the waveform, and second-guessing an explicit
+    // choice would be worse than any default. Only when nothing was chosen
+    // do we go looking for a loud section: starting every auto-generated
+    // video at 0:00 meant opening on the track's intro, which is the
+    // sparsest, quietest part of almost any produced piece of music.
+    let start: number;
+    if (typeof startSeconds === "number") {
+      start = Math.max(0, startSeconds);
+    } else {
+      const pick = await pickHighEnergyStart({
+        waveformUrl,
+        audioPath,
+        trackLengthSeconds,
+        windowSeconds: clipDurationSeconds,
+      });
+      start = pick.startSeconds;
+      console.log(`[music] auto start ${start.toFixed(1)}s for track ${trackId} (via ${pick.source})`);
+    }
+
     // atrim works in absolute track time, so the window is start → start+len.
     // asetpts rebases the trimmed audio to zero; without it the audio keeps
     // its original timestamps and stays silent until that point in the track
     // would have arrived.
-    const start = Math.max(0, startSeconds ?? 0);
     const end = start + clipDurationSeconds;
     const fadeStart = Math.max(0, clipDurationSeconds - 1);
     await runFfmpeg([
@@ -241,6 +280,7 @@ export async function mixTrackIntoClip(
       // a 7.5s video come out 2 minutes long once mixed with a longer track.
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
+      ...deliveryEncode(),
       "-c:a", "aac",
       "-t", String(clipDurationSeconds),
       "-y", outputPath,

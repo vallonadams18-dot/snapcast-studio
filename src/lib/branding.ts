@@ -5,10 +5,14 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
+import { VIDEO_FPS, intermediateEncode, deliveryEncode } from "@/lib/encoding";
 
 const WIDTH = 1080;
 const HEIGHT = 1920;
-const FPS = 25;
+// Must stay identical to the montage frame rate — the bookend cards are
+// concatenated with the montage, and mismatched rates yield a
+// variable-frame-rate file that players scrub badly.
+const FPS = VIDEO_FPS;
 
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -114,6 +118,7 @@ async function createBrandCard(opts: {
     "-t", String(durationSeconds),
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
+    ...intermediateEncode(),
     "-c:a", "aac",
     "-r", String(FPS),
     "-y", outputPath,
@@ -174,6 +179,7 @@ export async function addBrandBookends(
       "-map", "1:a",
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
+      ...intermediateEncode(),
       "-c:a", "aac",
       "-r", String(FPS),
       "-shortest",
@@ -185,7 +191,7 @@ export async function addBrandBookends(
         "-i", videoPath,
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
         "-map", "0:v", "-map", "1:a",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", ...intermediateEncode(), "-c:a", "aac",
         "-r", String(FPS), "-shortest", "-y", normalizedPath,
       ]);
     });
@@ -226,6 +232,7 @@ export async function addBrandBookends(
       "-f", "concat", "-safe", "0", "-i", listPath,
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
+      ...intermediateEncode(),
       "-c:a", "aac",
       "-r", String(FPS),
       "-y", outputPath,
@@ -305,7 +312,11 @@ export async function applyWatermark(
       `[0:v][wm]overlay=${overlayPosition(options.position)}`,
     ].join(";");
 
-    const videoOut = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy"];
+    // Watermarking is the last pass in the montage/clip chain, so this is the
+    // file a client downloads — encode it at delivery quality with the moov
+    // atom up front. Audio is copied, not re-encoded: it was already muxed by
+    // the music step and a second aac pass would only lose more.
+    const videoOut = ["-c:v", "libx264", "-pix_fmt", "yuv420p", ...deliveryEncode(), "-c:a", "copy"];
     const photoOut = ["-q:v", "3"];
     const outArgs = kind === "video" ? videoOut : photoOut;
 

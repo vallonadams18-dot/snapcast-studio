@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { getAnthropicClient } from "@/lib/ai";
 import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
-import type { MontageStyle } from "@/lib/montageStyles";
+import { VIDEO_FPS, intermediateEncode, deliveryEncode } from "@/lib/encoding";
+import { photoDurations, type MontageStyle } from "@/lib/montageStyles";
 
 // ffmpeg's filtergraph mini-language treats `:`, `\`, and unescaped `'` as
 // syntax, so any path fed into a filter option (fontfile=, textfile=) needs
@@ -198,7 +199,16 @@ const CROP_FILTERS = ["scale=1080:1920:force_original_aspect_ratio=increase", "c
 export async function createVerticalClip(options: CreateClipOptions): Promise<void> {
   const duration = options.endSeconds - options.startSeconds;
   const inputArgs = ["-ss", String(options.startSeconds), "-i", options.sourcePath, "-t", String(duration)];
-  const outputArgs = ["-c:v", "libx264", "-c:a", "aac", "-y", options.outputPath];
+  // No -r here on purpose: this is cut from real footage, and forcing a
+  // frame rate onto someone's 60fps phone video would resample it for no
+  // reason. The bookend/concat step normalises rate later if it runs.
+  const outputArgs = [
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    ...deliveryEncode(),
+    "-c:a", "aac",
+    "-y", options.outputPath,
+  ];
 
   if (options.captionText) {
     const escaped = escapeDrawtextValue(options.captionText.slice(0, 120));
@@ -242,38 +252,72 @@ export async function trimVideo(opts: {
     "-t", String(duration),
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
+    ...deliveryEncode(),
     "-c:a", "aac",
     "-y", opts.outputPath,
   ]);
 }
 
-const MONTAGE_FPS = 25;
+// Filter expressions must carry plain decimals — a very small step printed
+// in exponential form (1e-7) is a syntax error inside a filtergraph.
+function fixed(value: number): string {
+  return value.toFixed(6);
+}
 
-// zoompan works in whole frames, and it re-evaluates its expression per
-// output frame, so motion is expressed as "how much per frame".
-function motionFilter(motion: MontageStyle["motion"], frameCount: number, index: number): string | null {
-  const size = `:d=${frameCount}:s=1080x1920:fps=${MONTAGE_FPS}`;
+// zoompan re-evaluates its expression once per OUTPUT frame, so a camera
+// move is expressed as "how much per frame".
+//
+// The step is derived from the segment's real frame count rather than being
+// a fixed constant, which is the whole fix here. Previously a hardcoded
+// 0.0009/frame ran against a 1.14 cap: over a 3.2s segment that is only
+// 80-96 frames, so it reached ~1.07 and stopped — a 7% move, below what the
+// eye registers, and the stated cap was never once reached. Solving
+// step = magnitude / (frames - 1) makes the cap a DESTINATION the move
+// actually arrives at, and it stays correct now that segments have
+// different lengths.
+function motionFilter(
+  motion: MontageStyle["motion"],
+  frameCount: number,
+  index: number,
+  magnitude: number,
+): string | null {
+  if (motion === "none" || magnitude <= 0) return null;
+
+  const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
   // Centre the zoom origin. zoompan's default origin is the top-left, which
   // makes a zoom drift toward the corner and slide the subject out of frame.
   const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
 
+  // Guard against a 1-frame segment: no span to move across, and the step
+  // would divide by zero.
+  const span = Math.max(1, frameCount - 1);
+  const target = 1 + magnitude;
+  const step = magnitude / span;
+
+  // `eq(on,0)` — the first output frame. This used to read `eq(on,1)`, which
+  // set the SECOND frame, so frame 0 rendered un-zoomed and then snapped: a
+  // visible one-frame pop at the head of every pull-back segment.
+  const pullBack = `z='if(eq(on,0),${fixed(target)},max(zoom-${fixed(step)},1.0))'`;
+  const pushIn = `z='min(zoom+${fixed(step)},${fixed(target)})'`;
+
   switch (motion) {
     case "zoom-in":
-      return `zoompan=z='min(zoom+0.0009,1.14)'${centre}${size}`;
+      return `zoompan=${pushIn}${centre}${size}`;
     case "zoom-out":
-      // Start pushed in and pull back. zoom starts at 1.14 and eases down.
-      return `zoompan=z='if(eq(on,1),1.14,max(zoom-0.0009,1.0))'${centre}${size}`;
-    case "pan-right":
-      // Hold a slight zoom so there's headroom to travel across.
-      return `zoompan=z='1.12':x='(iw-iw/zoom)*(on/${frameCount})':y='ih/2-(ih/zoom/2)'${size}`;
+      return `zoompan=${pullBack}${centre}${size}`;
+    case "pan-right": {
+      // Travel across the frame is (1 - 1/zoom) of its width, so invert that
+      // to get the zoom needed for the requested travel. `on/span` reaches
+      // 1.0 on the final frame, so the pan completes exactly on the cut.
+      const panZoom = 1 / (1 - Math.min(0.5, magnitude));
+      return `zoompan=z='${fixed(panZoom)}':x='(iw-iw/zoom)*(on/${span})':y='ih/2-(ih/zoom/2)'${size}`;
+    }
     case "alternate":
       // Alternating push/pull is what gives a fast cut sequence its rhythm —
       // every photo moving the same direction reads as one long drift.
       return index % 2 === 0
-        ? `zoompan=z='min(zoom+0.0016,1.18)'${centre}${size}`
-        : `zoompan=z='if(eq(on,1),1.18,max(zoom-0.0016,1.0))'${centre}${size}`;
-    case "none":
-      return null;
+        ? `zoompan=${pushIn}${centre}${size}`
+        : `zoompan=${pullBack}${centre}${size}`;
   }
 }
 
@@ -296,12 +340,22 @@ async function createPhotoSegment(
   style: MontageStyle,
   index: number,
   outputPath: string,
+  durationSeconds: number,
 ): Promise<void> {
-  const frameCount = Math.round(style.secondsPerPhoto * MONTAGE_FPS);
-  const motion = motionFilter(style.motion, frameCount, index);
+  const frameCount = Math.max(2, Math.round(durationSeconds * VIDEO_FPS));
+  const motion = motionFilter(style.motion, frameCount, index, style.motionMagnitude);
 
-  const inputArgs = ["-loop", "1", "-i", photoPath, "-t", String(style.secondsPerPhoto)];
-  const outputArgs = ["-r", String(MONTAGE_FPS), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", outputPath];
+  const inputArgs = ["-loop", "1", "-i", photoPath, "-t", String(durationSeconds)];
+  // Intermediate quality: this segment gets re-encoded at least once more
+  // (transition concat, then music, then watermark), so it is encoded finer
+  // than delivery to stop those generations compounding.
+  const outputArgs = [
+    "-r", String(VIDEO_FPS),
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    ...intermediateEncode(),
+    "-y", outputPath,
+  ];
 
   // Ordered best → simplest. First that succeeds wins.
   const attempts: string[][] = [];
@@ -334,6 +388,7 @@ async function createPhotoSegment(
 async function concatWithTransitions(
   segmentPaths: string[],
   style: MontageStyle,
+  durations: number[],
   outputPath: string,
 ): Promise<boolean> {
   if (style.transition === "cut" || segmentPaths.length < 2) return false;
@@ -342,17 +397,22 @@ async function concatWithTransitions(
   const d = style.transitionSeconds;
   const steps: string[] = [];
   let current = "[0:v]";
-  // Each xfade overlaps the pair by `d`, so the running length of everything
-  // merged so far is (n * segment) - (transitions * d). The next offset is
-  // that length minus one more transition.
-  let elapsed = style.secondsPerPhoto;
+  // Each xfade overlaps its pair by `d`, so the running length of everything
+  // merged so far shrinks by one `d` per join. The next offset is that
+  // running length minus one more transition.
+  //
+  // This accumulates the ACTUAL per-segment durations. It previously reused
+  // one constant for every segment, which was correct only while all photos
+  // were the same length — with variable pacing that assumption silently
+  // drifts the transitions out of place a little further at every join.
+  let elapsed = durations[0];
 
   for (let i = 1; i < segmentPaths.length; i++) {
     const label = i === segmentPaths.length - 1 ? "[out]" : `[v${i}]`;
-    const offset = Math.max(0, elapsed - d);
+    const offset = Math.round(Math.max(0, elapsed - d) * 1000) / 1000;
     steps.push(`${current}[${i}:v]xfade=transition=${style.transition}:duration=${d}:offset=${offset}${label}`);
     current = label;
-    elapsed = offset + style.secondsPerPhoto;
+    elapsed = offset + durations[i];
   }
 
   try {
@@ -360,9 +420,10 @@ async function concatWithTransitions(
       ...inputs,
       "-filter_complex", steps.join(";"),
       "-map", "[out]",
-      "-r", String(MONTAGE_FPS),
+      "-r", String(VIDEO_FPS),
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
+      ...intermediateEncode(),
       "-y", outputPath,
     ]);
     return true;
@@ -379,34 +440,43 @@ export interface PhotoMontageOptions {
   outputPath: string;
 }
 
-// Total runtime of a montage, accounting for transition overlap. Callers
-// need this to trim the music track to length.
-export function montageDurationSeconds(photoCount: number, style: MontageStyle): number {
-  const raw = photoCount * style.secondsPerPhoto;
-  if (style.transition === "cut" || photoCount < 2) return raw;
-  return raw - (photoCount - 1) * style.transitionSeconds;
+// Predicted runtime of a montage, accounting for transition overlap.
+//
+// This is now only a FALLBACK. Callers that need a real duration to trim
+// music against should probe the rendered file with getVideoDurationSeconds
+// instead: a prediction cannot account for branded bookends, an xfade that
+// silently fell back to hard cuts on an older ffmpeg, or encoder rounding —
+// and each of those shifts the picture's end away from the music's.
+export function montageDurationSeconds(durations: number[], style: MontageStyle): number {
+  const raw = durations.reduce((a, b) => a + b, 0);
+  if (style.transition === "cut" || durations.length < 2) return raw;
+  return raw - (durations.length - 1) * style.transitionSeconds;
 }
 
 // Compiles photos into one vertical video in the chosen style. Silent; mix
 // music in separately via lib/music.ts#mixTrackIntoClip, which works on any
 // video whether or not it already has an audio track.
-export async function createPhotoMontage(options: PhotoMontageOptions): Promise<void> {
+export async function createPhotoMontage(options: PhotoMontageOptions): Promise<number[]> {
   const { style } = options;
   if (options.photoPaths.length === 0) throw new Error("No photos to compile");
+
+  // Per-photo screen time, varied by the style's pacing profile. Returned to
+  // the caller so it can predict a duration if probing the output fails.
+  const durations = photoDurations(options.photoPaths.length, style);
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-montage-"));
   try {
     const segmentPaths: string[] = [];
     for (const [i, photoPath] of options.photoPaths.entries()) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
-      await createPhotoSegment(photoPath, style, i, segPath);
+      await createPhotoSegment(photoPath, style, i, segPath, durations[i]);
       segmentPaths.push(segPath);
     }
 
     // Preferred path: real transitions between shots. Returns false on
     // ffmpeg builds without xfade (< 4.3), where we fall through to cuts.
-    if (await concatWithTransitions(segmentPaths, style, options.outputPath)) {
-      return;
+    if (await concatWithTransitions(segmentPaths, style, durations, options.outputPath)) {
+      return durations;
     }
 
     const concatListPath = path.join(tmpDir, "concat.txt");
@@ -423,10 +493,14 @@ export async function createPhotoMontage(options: PhotoMontageOptions): Promise<
       "-f", "concat",
       "-safe", "0",
       "-i", concatListPath,
+      "-r", String(VIDEO_FPS),
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
+      ...intermediateEncode(),
       "-y", options.outputPath,
     ]);
+
+    return durations;
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }

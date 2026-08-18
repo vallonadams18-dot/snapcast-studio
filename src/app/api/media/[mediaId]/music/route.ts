@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getTrackById } from "@/lib/musicCatalog";
@@ -6,28 +9,7 @@ import { mixTrackIntoClip } from "@/lib/music";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
 import { rateLimit } from "@/lib/rateLimit";
-import { getMontageStyle } from "@/lib/montageStyles";
-
-// A clip has an explicit time range; a photo montage doesn't, so its
-// duration is derived from how many source photos it was compiled from.
-function resolveVideoDuration(media: {
-  clipStartSeconds: number | null;
-  clipEndSeconds: number | null;
-  compiledFromMediaIds: string | null;
-}): number | null {
-  if (media.clipStartSeconds !== null && media.clipEndSeconds !== null) {
-    return media.clipEndSeconds - media.clipStartSeconds;
-  }
-  if (media.compiledFromMediaIds) {
-    try {
-      const ids = JSON.parse(media.compiledFromMediaIds) as string[];
-      return ids.length * getMontageStyle(null).secondsPerPhoto;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
+import { getVideoDurationSeconds } from "@/lib/video";
 
 export async function POST(request: Request, { params }: { params: Promise<{ mediaId: string }> }) {
   const account = await getCurrentAccount();
@@ -60,34 +42,54 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
 
   let storagePath = media.storagePath;
   let sourceUrl = media.sourceUrl;
-
-  // Only attempt a real mix when we can work out the video's duration
-  // (clip or photo montage) and a licensed library is connected —
-  // otherwise this just tags the choice, same as before.
-  const duration = resolveVideoDuration(media);
   let mixed = false;
-  if (duration !== null) {
-    try {
+
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-music-swap-"));
+  try {
+    if (media.mediaType === "video") {
       const original = await getMediaBytes(media);
-      const result = await mixTrackIntoClip(
-        original,
-        trackId ?? media.musicTrack ?? "cinematic",
-        duration,
-        libraryTrackId,
-        startSeconds,
-      );
-      if (result) {
-        // Cache-bust on the filename: the browser has the old mix cached at
-        // the previous URL, and reusing it would play the old audio.
-        const key = randomFileKey(media.eventId, `clip-${media.id}-${Date.now()}.mp4`);
-        const saved = await getStorageAdapter().save(key, result, "video/mp4");
-        storagePath = saved.storageRef;
-        sourceUrl = saved.url;
-        mixed = true;
+
+      // Measure the file itself.
+      //
+      // This used to derive a duration from montage metadata — photo count
+      // multiplied by the DEFAULT style's seconds-per-photo — which was
+      // wrong for every style except cinematic and ignored transition
+      // overlap entirely. An 8-photo "punchy" montage really runs ~11s but
+      // was computed as 25.6s, so the swapped track kept playing for about
+      // fourteen seconds after the picture had ended.
+      //
+      // The rendered file already knows its own length. Ask it.
+      const probePath = path.join(tmpDir, "current.mp4");
+      await writeFile(probePath, original);
+      const duration = await getVideoDurationSeconds(probePath).catch(() => null);
+
+      if (duration !== null && duration > 0) {
+        try {
+          const result = await mixTrackIntoClip(
+            original,
+            trackId ?? media.musicTrack ?? "cinematic",
+            duration,
+            libraryTrackId,
+            startSeconds,
+          );
+          if (result) {
+            // Cache-bust on the filename: the browser has the old mix cached
+            // at the previous URL, and reusing it would play the old audio.
+            const key = randomFileKey(media.eventId, `clip-${media.id}-${Date.now()}.mp4`);
+            const saved = await getStorageAdapter().save(key, result, "video/mp4");
+            storagePath = saved.storageRef;
+            sourceUrl = saved.url;
+            mixed = true;
+          }
+        } catch (err) {
+          console.error("[music] Track swap mix failed, keeping tag-only", err);
+        }
+      } else {
+        console.error("[music] Could not measure media duration, keeping tag-only", mediaId);
       }
-    } catch (err) {
-      console.error("[music] Track swap mix failed, keeping tag-only", err);
     }
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
   }
 
   const updated = await prisma.media.update({

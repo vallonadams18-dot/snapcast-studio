@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { createPhotoMontage, montageDurationSeconds } from "@/lib/video";
+import { createPhotoMontage, montageDurationSeconds, getVideoDurationSeconds } from "@/lib/video";
 import { mixTrackIntoClip } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
@@ -74,11 +74,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     }
 
     const montagePath = path.join(tmpDir, "montage.mp4");
-    await createPhotoMontage({ photoPaths, style, outputPath: montagePath });
+    const segmentDurations = await createPhotoMontage({ photoPaths, style, outputPath: montagePath });
 
     let montageBuffer = await readFile(montagePath);
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
-    let totalDuration = montageDurationSeconds(selected.length, style);
 
     // Bookends go on BEFORE the music so the track plays across the logo
     // cards too, rather than starting abruptly after the intro.
@@ -87,11 +86,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       { logoUrl: account.brandLogoUrl, brandColorsJson: account.brandColors, businessName: account.businessName },
       { intro: account.introEnabled, outro: account.outroEnabled, outroText: account.outroText },
     );
-    if (branded) {
-      montageBuffer = branded;
-      // The music trim has to cover the added cards or the tail runs silent.
-      totalDuration += (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0);
-    }
+    if (branded) montageBuffer = branded;
+
+    // Measure the video we are actually about to score, rather than
+    // predicting a length from the style's metadata.
+    //
+    // A prediction cannot know whether the branded cards rendered, whether
+    // xfade was available on this ffmpeg build (it silently drops to hard
+    // cuts on < 4.3, which makes the montage LONGER than predicted), or how
+    // the encoder rounded. Every one of those pushes the music's end away
+    // from the picture's. Probing the finished file is the only figure that
+    // is right in all of those cases.
+    const measuredPath = path.join(tmpDir, "measured.mp4");
+    await writeFile(measuredPath, montageBuffer);
+    const predictedDuration =
+      montageDurationSeconds(segmentDurations, style) +
+      (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
+    const totalDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
     const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration);
     if (mixed) montageBuffer = mixed;
