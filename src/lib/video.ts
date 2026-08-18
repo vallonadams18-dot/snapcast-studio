@@ -346,50 +346,104 @@ function fixed(value: number): string {
   return value.toFixed(6);
 }
 
-// zoompan re-evaluates its expression once per OUTPUT frame, so a camera
-// move is expressed as "how much per frame".
+// ------------------------------------------------------------- 2D motion --
 //
-// The step is derived from the segment's real frame count rather than being
-// a fixed constant, which is the whole fix here. Previously a hardcoded
-// 0.0009/frame ran against a 1.14 cap: over a 3.2s segment that is only
-// 80-96 frames, so it reached ~1.07 and stopped — a 7% move, below what the
-// eye registers, and the stated cap was never once reached. Solving
-// step = magnitude / (frames - 1) makes the cap a DESTINATION the move
-// actually arrives at, and it stays correct now that segments have
-// different lengths.
-function motionFilter(motion: SegmentMotion, frameCount: number, magnitude: number): string | null {
+// Motion is a DIRECT expression of the output frame index `on`, not a
+// per-frame recurrence. That is what makes easing possible: progress
+// p = on/span runs 0→1 across the segment, an easing curve reshapes it, and
+// the zoom or pan position is computed from the eased value each frame.
+// (It also retires the old eq(on,0) first-frame hack — a direct expression
+// has no accumulated state to seed.) Constant-velocity motion is the single
+// biggest "screensaver" tell; easing is what makes a move feel operated.
+
+/** Eased progress 0→1 as a filtergraph expression. `span` = frames - 1. */
+function easedProgress(easing: EditSegment["easing"], span: number): string {
+  const p = `(on/${span})`;
+  const easeInOutOf = (q: string) => `if(lt(${q},0.5),2*${q}*${q},1-pow(-2*${q}+2,2)/2)`;
+  switch (easing) {
+    case "linear":
+      return p;
+    case "ease-out":
+      // Fast start, gentle landing.
+      return `(1-pow(1-${p},2))`;
+    case "ease-in-out":
+      return easeInOutOf(p);
+    case "punch":
+      // Nearly all of the move lands in the first ~22% of the segment, then
+      // holds — the zoom hits WITH the cut, not gradually after it.
+      return `min(1,pow(${p}/0.22,0.75))`;
+    case "settle":
+      // The hero's easing: the move completes by 85% and the final frames
+      // REST, so the loop point lands on a composed, motionless frame
+      // instead of mid-drift.
+      return `if(gte(${p},0.85),1,${easeInOutOf(`(${p}/0.85)`)})`;
+  }
+}
+
+/** One zoompan filter executing the segment's move at the given magnitude. */
+function motionFilter(
+  motion: SegmentMotion,
+  frameCount: number,
+  magnitude: number,
+  easing: EditSegment["easing"],
+): string | null {
   if (motion === "none" || magnitude <= 0) return null;
 
-  const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
-  // Centre the zoom origin. zoompan's default origin is the top-left, which
-  // makes a zoom drift toward the corner and slide the subject out of frame.
-  const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
-
-  // Guard against a 1-frame segment: no span to move across, and the step
-  // would divide by zero.
   const span = Math.max(1, frameCount - 1);
-  const target = 1 + magnitude;
-  const step = magnitude / span;
-
-  // `eq(on,0)` — the first output frame. This used to read `eq(on,1)`, which
-  // set the SECOND frame, so frame 0 rendered un-zoomed and then snapped: a
-  // visible one-frame pop at the head of every pull-back segment.
-  const pullBack = `z='if(eq(on,0),${fixed(target)},max(zoom-${fixed(step)},1.0))'`;
-  const pushIn = `z='min(zoom+${fixed(step)},${fixed(target)})'`;
+  const E = easedProgress(easing, span);
+  const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
+  // Centre the zoom origin — zoompan's default is top-left, which walks the
+  // subject out of frame.
+  const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
+  const M = fixed(Math.min(0.5, magnitude));
+  // Pan travel across the frame is (1 - 1/zoom) of its size; invert to get
+  // the constant zoom that yields the requested travel.
+  const panZoom = fixed(1 / (1 - Math.min(0.5, magnitude)));
+  const yCentred = `:y='ih/2-(ih/zoom/2)'`;
+  const xCentred = `:x='iw/2-(iw/zoom/2)'`;
 
   switch (motion) {
-    case "zoom-in":
-      return `zoompan=${pushIn}${centre}${size}`;
-    case "zoom-out":
-      return `zoompan=${pullBack}${centre}${size}`;
-    case "pan-right": {
-      // Travel across the frame is (1 - 1/zoom) of its width, so invert that
-      // to get the zoom needed for the requested travel. `on/span` reaches
-      // 1.0 on the final frame, so the pan completes exactly on the cut.
-      const panZoom = 1 / (1 - Math.min(0.5, magnitude));
-      return `zoompan=z='${fixed(panZoom)}':x='(iw-iw/zoom)*(on/${span})':y='ih/2-(ih/zoom/2)'${size}`;
-    }
+    case "push-in":
+    case "zoom-punch":
+      // zoom-punch differs from push-in only by its easing, which the plan
+      // has already chosen — the renderer treats them identically.
+      return `zoompan=z='1+${M}*${E}'${centre}${size}`;
+    case "pull-out":
+      return `zoompan=z='1+${M}*(1-${E})'${centre}${size}`;
+    case "pan-right":
+      return `zoompan=z='${panZoom}':x='(iw-iw/zoom)*${E}'${yCentred}${size}`;
+    case "pan-left":
+      return `zoompan=z='${panZoom}':x='(iw-iw/zoom)*(1-${E})'${yCentred}${size}`;
+    case "pan-down":
+      return `zoompan=z='${panZoom}'${xCentred}:y='(ih-ih/zoom)*${E}'${size}`;
+    case "pan-up":
+      return `zoompan=z='${panZoom}'${xCentred}:y='(ih-ih/zoom)*(1-${E})'${size}`;
   }
+}
+
+/**
+ * The preset's grade, applied identically to every segment. Saturation and
+ * contrast via eq, a vignette scaled from the look value, and fine grain —
+ * the difference between "rendered" and "produced" is mostly this chain.
+ */
+function gradeChain(look: EditPlan["look"]): string {
+  const parts = [`eq=saturation=${fixed(look.saturation)}:contrast=${fixed(look.contrast)}`];
+  if (look.vignette > 0) parts.push(`vignette=angle=${fixed(Math.PI * Math.min(0.35, look.vignette))}`);
+  if (look.grain > 0) parts.push(`noise=alls=${Math.round(look.grain * 100)}:allf=t`);
+  return parts.join(",");
+}
+
+/**
+ * Slow rotation drift (-d° → +d°) across the segment. The frame is oversized
+ * ~10% first so the rotated corners never reveal the edge; at the 2.5° the
+ * Party preset uses, the required margin is ~46px against 54px available.
+ */
+function rotateChain(degrees: number, durationSeconds: number): string {
+  const d = fixed((degrees * Math.PI) / 180);
+  return (
+    `scale=1188:2112,rotate='(-${d})+2*${d}*t/${fixed(Math.max(0.1, durationSeconds))}':ow=1188:oh=2112:c=black,` +
+    `crop=1080:1920`
+  );
 }
 
 // Fits the photo into a 9:16 frame WITHOUT cropping the subject out: the
@@ -403,14 +457,38 @@ const BLURRED_FIT_FILTER = [
   "[bg][fg]overlay=(W-w)/2:(H-h)/2",
 ].join(";");
 
-// One photo → one vertical segment with the style's fit and camera move.
-// Degrades in two steps rather than failing: motion dropped first, then the
-// blurred fit — a plain slideshow still beats losing the feature entirely.
-async function createPhotoSegment(segment: EditSegment, outputPath: string): Promise<void> {
+/**
+ * Two-layer parallax: the blurred backdrop moves at bgMagnitude while the
+ * photo itself moves at the segment's own magnitude. The RATE DIFFERENCE is
+ * the depth cue — and because the photo's motion is applied to its own
+ * padded layer before compositing, the old artefact of the blurred bars
+ * zooming in lockstep with the photo is gone.
+ */
+function parallaxGraph(segment: EditSegment, frameCount: number, motion: string): string {
+  const span = Math.max(1, frameCount - 1);
+  const linearE = `(on/${span})`;
+  const bgM = fixed(Math.min(0.3, segment.bgMagnitude));
+  const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
+  const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
+  return [
+    `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=32,` +
+      `zoompan=z='1+${bgM}*${linearE}'${centre}${size}[bg]`,
+    `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
+      `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0.0,format=rgba,${motion}[fg]`,
+    `[bg][fg]overlay=(W-w)/2:(H-h)/2`,
+  ].join(";");
+}
+
+// One photo → one vertical segment carrying the plan's exact treatment:
+// motion + easing + parallax + grade + drift, all pre-resolved. The renderer
+// makes no creative choices — it only executes, and degrades in ordered
+// steps so a cosmetic failure can never cost the montage:
+//   full treatment → no rotate → no parallax → no grade → no motion → crop.
+async function createPhotoSegment(segment: EditSegment, plan: EditPlan, outputPath: string): Promise<void> {
   const frameCount = Math.max(2, Math.round(segment.durationSeconds * VIDEO_FPS));
-  // Duration, camera move and magnitude all come from THIS segment. Nothing
-  // is inferred from the segment's position — the plan already resolved that.
-  const motion = motionFilter(segment.motion, frameCount, segment.motionMagnitude);
+  const motion = motionFilter(segment.motion, frameCount, segment.motionMagnitude, segment.easing);
+  const grade = gradeChain(plan.look);
+  const rotate = segment.rotateDriftDegrees > 0 ? rotateChain(segment.rotateDriftDegrees, segment.durationSeconds) : null;
 
   const inputArgs = ["-loop", "1", "-i", segment.sourcePath, "-t", String(segment.durationSeconds)];
   // Intermediate quality: this segment gets re-encoded at least once more
@@ -428,12 +506,25 @@ async function createPhotoSegment(segment: EditSegment, outputPath: string): Pro
   const attempts: string[][] = [];
 
   if (segment.fit === "blurred") {
-    const chain = motion ? `${BLURRED_FIT_FILTER},${motion}` : BLURRED_FIT_FILTER;
-    attempts.push(["-filter_complex", chain]);
+    if (motion && segment.bgMagnitude > 0) {
+      const parallax = parallaxGraph(segment, frameCount, motion);
+      if (rotate) attempts.push(["-filter_complex", `${parallax},${grade},${rotate}`]);
+      attempts.push(["-filter_complex", `${parallax},${grade}`]);
+    }
+    // Single-layer composite with motion applied after the fit (the 2C
+    // treatment) — the parallax fallback and the no-parallax presets' path.
+    if (motion) {
+      attempts.push(["-filter_complex", `${BLURRED_FIT_FILTER},${motion},${grade}`]);
+      attempts.push(["-filter_complex", `${BLURRED_FIT_FILTER},${motion}`]);
+    }
+    attempts.push(["-filter_complex", `${BLURRED_FIT_FILTER},${grade}`]);
     attempts.push(["-filter_complex", BLURRED_FIT_FILTER]);
   } else {
-    const chain = motion ? [...CROP_FILTERS, motion].join(",") : CROP_FILTERS.join(",");
-    attempts.push(["-vf", chain]);
+    if (motion) {
+      attempts.push(["-vf", [...CROP_FILTERS, motion, grade].join(",")]);
+      attempts.push(["-vf", [...CROP_FILTERS, motion].join(",")]);
+    }
+    attempts.push(["-vf", [...CROP_FILTERS, grade].join(",")]);
   }
   attempts.push(["-vf", CROP_FILTERS.join(",")]);
 
@@ -529,7 +620,7 @@ export async function createPhotoMontage(options: PhotoMontageOptions): Promise<
     const segmentPaths: string[] = [];
     for (const [i, segment] of segments.entries()) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
-      await createPhotoSegment(segment, segPath);
+      await createPhotoSegment(segment, options.plan, segPath);
       segmentPaths.push(segPath);
     }
 

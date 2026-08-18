@@ -16,7 +16,7 @@ import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/edit
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
 import { analyzeSectionEnergy } from "@/lib/audioEnergy";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
-import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
+import { getMontageStyle, suggestStyleForEventType, chooseAutoPreset } from "@/lib/montageStyles";
 import { analyzeClip, PLATFORMS } from "@/lib/ai";
 import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
@@ -45,7 +45,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
 
   // Body is optional — an omitted/!json body just means "pick for me".
   const body = await request.json().catch(() => ({}) as Record<string, unknown>);
-  const style =
+  // What the client ASKED for. "auto" is resolved to a concrete preset only
+  // after the track and energy analysis exist, because that is what it
+  // chooses from — see below.
+  const requestedStyle =
     typeof body.styleId === "string"
       ? getMontageStyle(body.styleId)
       : suggestStyleForEventType(event.eventType);
@@ -126,7 +129,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     // Waveform-only — needs no audio download, so the 402 doesn't block it.
     // The estimate of the section length is fine here: this chooses a loud
     // neighbourhood, not a frame-accurate cue.
-    const estimatedLength = selection.selected.length * style.secondsPerPhoto;
+    const estimatedLength = selection.selected.length * requestedStyle.secondsPerPhoto;
     const energy = await analyzeSectionEnergy({
       waveformUrl: track?.waveformUrl,
       trackLengthSeconds: track?.lengthSeconds,
@@ -143,6 +146,30 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
         `[music] energy peak at +${energy.peakOffsetSeconds}s of section starting ${energy.sectionStartSeconds}s` +
           (energy.clampedFromEnd ? " (raw max was in the final 20% — clamped earlier)" : ""),
       );
+    }
+
+    // Resolve "auto" to ONE concrete preset now that its inputs exist: the
+    // event type, the resolved track BPM, the analysed energy shape, and the
+    // photo set. One coherent visual language — never a blend.
+    let style = requestedStyle;
+    if (requestedStyle.id === "auto") {
+      const scores = selection.selected.map(
+        (s) =>
+          (s.candidate.energyScore ?? 0) +
+          (s.candidate.visualQualityScore ?? 0) +
+          (s.candidate.momentRarityScore ?? 0),
+      );
+      const mean = scores.reduce((a, b) => a + b, 0) / Math.max(1, scores.length);
+      const scoreVariance = scores.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, scores.length);
+      const auto = chooseAutoPreset({
+        eventType: event.eventType,
+        bpm: track?.bpm ?? null,
+        energyPeakFraction: energy?.peakFraction ?? null,
+        photoCount: selection.selected.length,
+        scoreVariance,
+      });
+      style = auto.style;
+      console.log(`[preset] AI Auto chose ${style.name} — ${auto.reason}`);
     }
 
     // The creative decisions are all made here, and settled before ffmpeg is
