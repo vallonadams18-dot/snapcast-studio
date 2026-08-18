@@ -116,6 +116,7 @@ function snapDurationsToBeats(
   durations: number[],
   beatIntervalSeconds: number,
   style: MontageStyle,
+  roles: NarrativeRole[],
 ): number[] {
   // A cross-fade longer than its segment breaks xfade outright, so this floor
   // is a correctness bound and snapping must never cross it.
@@ -170,6 +171,44 @@ function snapDurationsToBeats(
   const finalDrift = Math.abs(snapped.reduce((a, b) => a + b, 0) - target) / target;
   if (finalDrift > maxDrift) return durations;
 
+  // Hero hold emphasis.
+  //
+  // Snapping rounds to the nearest multiple, which can quietly flatten the
+  // ending: a real 67 BPM render put the hero at 3.58s and the opener at
+  // 3.58s too, so the shot the video rests on read as just another beat. The
+  // last frame is what plays as a social video loops, and it should feel
+  // deliberately held.
+  //
+  // Stepped up a whole beat at a time rather than padded with arbitrary
+  // seconds, so the hero stays on the same rhythmic grid as everything else.
+  const heroIndex = snapped.length - 1;
+  if (heroIndex > 0 && roles[heroIndex] === "hero") {
+    const peakIndex = roles.indexOf("peak");
+    // The two shots the hero has to out-hold: the opening hook and the peak.
+    const mustBeat = Math.max(snapped[0], peakIndex > 0 ? snapped[peakIndex] : 0);
+    // One step past the normal ceiling is allowed — a deliberate hold is
+    // exactly the case that earns it.
+    const ceiling = Math.max(...multiples) + 1;
+    // Slightly wider than the general budget, because this lengthens exactly
+    // one segment on purpose. Not wide enough to turn a 12s montage into 25s.
+    const heroDriftBudget = 0.15;
+
+    for (let step = 0; step < 4 && snapped[heroIndex] <= mustBeat + 1e-6; step++) {
+      const nextMultiple = Math.round(snapped[heroIndex] / beatIntervalSeconds) + 1;
+      if (nextMultiple > ceiling) break;
+      const candidate = nextMultiple * beatIntervalSeconds;
+      const projected = snapped.reduce((a, b) => a + b, 0) - snapped[heroIndex] + candidate;
+      if (Math.abs(projected - target) / target > heroDriftBudget) break;
+      snapped[heroIndex] = candidate;
+    }
+
+    // Requirement: snapping must never leave the hero SHORTER than the opener
+    // or the peak. If the tempo cannot express that, fall back to the style's
+    // own durations — photoDurations always gives the closing shot the
+    // largest multiplier, so hero-longest is guaranteed there.
+    if (snapped[heroIndex] < mustBeat - 1e-6) return durations;
+  }
+
   return snapped.map((d) => Math.round(Math.max(floor, d) * 1000) / 1000);
 }
 
@@ -214,7 +253,7 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
   const beatInterval = music?.beatIntervalSeconds ?? null;
   const durations =
     beatInterval && beatInterval > 0
-      ? snapDurationsToBeats(styleDurations, beatInterval, style)
+      ? snapDurationsToBeats(styleDurations, beatInterval, style, usable.map((u) => u.role))
       : styleDurations;
 
   const segments: EditSegment[] = usable.map((item, index) => ({
