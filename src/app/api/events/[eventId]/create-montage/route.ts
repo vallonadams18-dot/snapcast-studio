@@ -180,6 +180,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     };
     // The SAME track object whose BPM shaped the pacing above.
     const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration, null, null, track);
+    // Whether the video actually has music, as opposed to whether we tried.
+    // The mixer returns null for every failure — no provider configured, the
+    // provider unreachable, or the licence not permitting a download — and
+    // without surfacing that, a silent video is indistinguishable from one
+    // the client simply didn't notice the music in.
+    const musicMixed = Boolean(mixed);
     console.log(
       `[music] planned with track=${track?.id ?? "none"} bpm=${track?.bpm ?? "unknown"} ` +
         `beat=${beatIntervalSeconds ? `${beatIntervalSeconds.toFixed(3)}s` : "n/a"} | ` +
@@ -241,6 +247,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       photoCount: selected.length,
       style: style.name,
       duplicatesSkipped: selection.duplicatesFound,
+      // Non-fatal. The video is finished and usable either way; this only
+      // says whether it has a soundtrack, so the client is told rather than
+      // left to discover a silent video after posting it.
+      musicMixed,
+      musicWarning: musicMixed
+        ? null
+        : "Video created without music — licensed music is currently unavailable.",
     });
   } catch (err) {
     return NextResponse.json(

@@ -19,6 +19,8 @@ export function PhotoMontageButton({
   const [status, setStatus] = useState<"idle" | "working" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  // Non-fatal advisory: the render succeeded but has no soundtrack.
+  const [notice, setNotice] = useState<string | null>(null);
   const [styleId, setStyleId] = useState(suggestedStyleId);
 
   if (readyPhotoCount < 2) return null;
@@ -27,6 +29,7 @@ export function PhotoMontageButton({
     setStatus("working");
     setError(null);
     setSuccess(null);
+    setNotice(null);
     try {
       const response = await fetch(`/api/events/${eventId}/create-montage`, {
         method: "POST",
@@ -46,6 +49,10 @@ export function PhotoMontageButton({
           (skipped > 0 ? `, skipping ${skipped} near-duplicate${skipped === 1 ? "" : "s"}` : "") +
           `. It's in your media below.`,
       );
+      // A silent video is a usable video, but only if you know it's silent
+      // before you post it. Shown as a warning, not an error — the render
+      // succeeded.
+      setNotice(typeof body.musicWarning === "string" ? body.musicWarning : null);
       router.refresh();
     } catch (err) {
       setStatus("error");
@@ -103,6 +110,9 @@ export function PhotoMontageButton({
         <div className="mt-2">
           <SuccessBanner message={success} />
         </div>
+      )}
+      {notice && (
+        <p className="mt-2 rounded-lg bg-warning/15 px-3 py-2 text-xs text-warning">⚠ {notice}</p>
       )}
     </div>
   );
