@@ -9,6 +9,13 @@ import { MusicLibrary } from "./MusicLibrary";
 export interface MediaUpdate {
   sourceUrl: string;
   musicTrackTitle?: string | null;
+  /**
+   * Set when the edit produced a NEW derivative row (trimming a raw upload
+   * does — the original is never touched). The open player retargets to the
+   * derivative so further edits chain off it, not the original.
+   */
+  id?: string;
+  sourceMediaId?: string | null;
 }
 
 // Manual editing for a generated video: trim the range and swap the music.
@@ -105,11 +112,16 @@ export function VideoEditPanel({
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "Couldn't trim the video.");
 
-      setNotice("Trim saved");
-      // Hand the new URL up. The player swaps it in and re-renders this
-      // panel with the new sourceUrl, which re-probes the duration above.
-      // Deliberately does NOT close anything.
-      onUpdated({ sourceUrl: body.sourceUrl });
+      // Trimming a RAW upload saves a new clip and never touches the
+      // original — say so, and retarget this editor at the new clip so any
+      // further edit chains off the derivative rather than the original.
+      if (body.isNewClip) {
+        setNotice("Saved as a new clip — your original video is untouched");
+        onUpdated({ sourceUrl: body.sourceUrl, id: body.mediaId, sourceMediaId: body.sourceMediaId });
+      } else {
+        setNotice("Trim saved");
+        onUpdated({ sourceUrl: body.sourceUrl });
+      }
       router.refresh();
     } catch (err) {
       // Stay open on failure — closing would throw away the range they set.
@@ -228,7 +240,9 @@ export function VideoEditPanel({
                 {saving ? "Trimming…" : `Save trimmed video (${trimmedLength.toFixed(1)}s)`}
               </Button>
               <p className="mt-1 text-[10px] text-neutral-500">
-                This replaces the video. Your original uploads are untouched.
+                {isGenerated
+                  ? "This replaces the generated video. Your original uploads are untouched."
+                  : "Saves as a new clip — your original video stays exactly as uploaded."}
               </p>
             </>
           )}

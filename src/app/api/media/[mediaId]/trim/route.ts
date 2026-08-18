@@ -64,6 +64,41 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
     const key = randomFileKey(media.eventId, `edit-${media.id}-${Date.now()}.mp4`);
     const saved = await getStorageAdapter().save(key, trimmed, "video/mp4");
 
+    // A RAW upload — not cut from anything, not compiled from photos — is
+    // the customer's own footage, and the UI promises "your original uploads
+    // are untouched". Trimming one must therefore CREATE a derivative row
+    // rather than update in place: the old behaviour overwrote the raw row's
+    // storage reference, structurally losing the original, and stamped clip
+    // fields onto it — which then fooled the music route's raw-upload guard
+    // into treating the original as a mixable clip.
+    //
+    // Generated videos (clips, montages, previous trims) keep the documented
+    // replace-in-place behaviour; they are already derivatives.
+    const isRawUpload = !media.sourceMediaId && !media.compiledFromMediaIds;
+
+    if (isRawUpload) {
+      const derivative = await prisma.media.create({
+        data: {
+          accountId: account.id,
+          eventId: media.eventId,
+          mediaType: "video",
+          storagePath: saved.storageRef,
+          sourceUrl: saved.url,
+          status: "ready",
+          sourceMediaId: media.id,
+          clipStartSeconds: 0,
+          clipEndSeconds: renderedDuration,
+        },
+      });
+      return NextResponse.json({
+        mediaId: derivative.id,
+        sourceMediaId: media.id,
+        sourceUrl: derivative.sourceUrl,
+        durationSeconds: renderedDuration,
+        isNewClip: true,
+      });
+    }
+
     const updated = await prisma.media.update({
       where: { id: mediaId },
       data: {
@@ -77,8 +112,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
     });
 
     return NextResponse.json({
+      mediaId: updated.id,
       sourceUrl: updated.sourceUrl,
       durationSeconds: renderedDuration,
+      isNewClip: false,
     });
   } catch (err) {
     console.error("[trim] failed", err);
