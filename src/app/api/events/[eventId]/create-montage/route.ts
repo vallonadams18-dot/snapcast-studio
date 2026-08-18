@@ -14,6 +14,7 @@ import {
 } from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
+import { analyzeSectionEnergy } from "@/lib/audioEnergy";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
 import { analyzeClip, PLATFORMS } from "@/lib/ai";
@@ -21,7 +22,7 @@ import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
 import { isFeatureEnabled } from "@/lib/featureFlags";
 import { addBrandBookends, applyWatermark } from "@/lib/branding";
-import { selectPhotosForMontage } from "@/lib/photoSelection";
+import { selectPhotosForMontage, repositionPeak } from "@/lib/photoSelection";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
@@ -88,7 +89,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     // alike, because scoring never compared one photo to another — and it
     // ordered them best-to-worst, so the weakest image was always the one
     // left on screen at the end, which is what a looping video rests on.
-    const selection = await selectPhotosForMontage(candidates, MAX_PHOTOS, resolvePath);
+    let selection = await selectPhotosForMontage(candidates, MAX_PHOTOS, resolvePath);
     const selected = selection.selected.map((s) => s.candidate);
 
     if (selected.length < MIN_PHOTOS) {
@@ -120,6 +121,30 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     const track = await resolveTrackForCategory(suggestedTrack).catch(() => null);
     const beatIntervalSeconds = track?.bpm ? 60 / track.bpm : null;
 
+    // Find where the music's energy peaks inside the section we'll use, so
+    // the strongest VISUAL moment can sit on the strongest AUDIO moment.
+    // Waveform-only — needs no audio download, so the 402 doesn't block it.
+    // The estimate of the section length is fine here: this chooses a loud
+    // neighbourhood, not a frame-accurate cue.
+    const estimatedLength = selection.selected.length * style.secondsPerPhoto;
+    const energy = await analyzeSectionEnergy({
+      waveformUrl: track?.waveformUrl,
+      trackLengthSeconds: track?.lengthSeconds,
+      windowSeconds: estimatedLength,
+      sectionStartSeconds: null,
+    }).catch(() => null);
+
+    if (energy) {
+      // Same photos, same roles — only the peak's position moves. Hero stays
+      // last by construction; analyzeSectionEnergy has already pushed a
+      // final-20% maximum to an earlier region.
+      selection = { ...selection, selected: repositionPeak(selection.selected, energy.peakFraction) };
+      console.log(
+        `[music] energy peak at +${energy.peakOffsetSeconds}s of section starting ${energy.sectionStartSeconds}s` +
+          (energy.clampedFromEnd ? " (raw max was in the final 20% — clamped earlier)" : ""),
+      );
+    }
+
     // The creative decisions are all made here, and settled before ffmpeg is
     // touched. The renderer below only executes this.
     const plan = buildEditPlan({
@@ -132,9 +157,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
         catalogId: suggestedTrack,
         trackId: track?.id ?? null,
         title: track?.title ?? null,
-        startSeconds: null,
+        // Pinned at plan time when analysis succeeded, so the section whose
+        // energy shaped the visual peak is the section that actually plays.
+        // Null falls back to the mixer's own picker, as before.
+        startSeconds: energy?.sectionStartSeconds ?? null,
         bpm: track?.bpm ?? null,
         beatIntervalSeconds,
+        energyPeakOffsetSeconds: energy?.peakOffsetSeconds ?? null,
       },
     });
 
@@ -184,7 +213,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       console.log(`[fps] ${label}: ${(await getVideoFrameRate(target).catch(() => null)) ?? "unknown"} fps`);
     };
     // The SAME track object whose BPM shaped the pacing above.
-    const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration, null, null, track);
+    const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration, null, plan.music?.startSeconds ?? null, track);
     // Whether the video actually has music, as opposed to whether we tried.
     // The mixer returns null for every failure — no provider configured, the
     // provider unreachable, or the licence not permitting a download — and

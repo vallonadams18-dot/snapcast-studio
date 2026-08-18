@@ -151,6 +151,97 @@ async function curveFromAudioFile(audioPath: string): Promise<number[] | null> {
   }
 }
 
+export interface SectionEnergy {
+  /** Where the analysed section starts, in track time. */
+  sectionStartSeconds: number;
+  /** Strongest SUSTAINED energy position, relative to the section start. */
+  peakOffsetSeconds: number;
+  /** peakOffsetSeconds / windowSeconds, clamped to 0..1. */
+  peakFraction: number;
+  /** True when the raw maximum sat in the final 20% and was re-searched earlier. */
+  clampedFromEnd: boolean;
+  source: EnergySource;
+}
+
+/**
+ * Locate the strongest sustained energy region WITHIN a music section.
+ *
+ * Waveform-only on purpose: the download endpoint currently 402s, but the
+ * waveform JSON rides along free on every search response, so this works
+ * with no audio bytes at all. Returns null whenever the waveform is missing,
+ * malformed, or the section leaves no room to choose — callers keep their
+ * existing narrative placement in that case. An enhancement, never a
+ * dependency.
+ *
+ * "Sustained" means a rolling sub-window (~a fifth of the section, at least
+ * 1.5s) is scored in linear power, so a held chorus outranks one transient
+ * hit — the same reasoning bestWindowStart already applies at track scale.
+ *
+ * The final-20% rule lives HERE, not in the caller: the hero shot owns the
+ * ending, so when the raw maximum falls in the section's last fifth the
+ * search re-runs restricted to the first 80% and reports that position
+ * instead, flagged as clamped. The narrative arc wins over the waveform.
+ */
+export async function analyzeSectionEnergy(options: {
+  waveformUrl?: string | null;
+  trackLengthSeconds?: number | null;
+  windowSeconds: number;
+  /** Explicit section start (the user's manual pick). Null = loudest window. */
+  sectionStartSeconds?: number | null;
+}): Promise<SectionEnergy | null> {
+  const { waveformUrl, windowSeconds } = options;
+  const trackLength = options.trackLengthSeconds ?? 0;
+  if (!waveformUrl || trackLength <= 0 || windowSeconds <= 0 || trackLength <= windowSeconds) return null;
+
+  const curve = await curveFromWaveform(waveformUrl);
+  if (!curve || curve.length < 4) return null;
+
+  const secondsPerBucket = trackLength / curve.length;
+  const sectionStart =
+    options.sectionStartSeconds != null
+      ? clampStart(options.sectionStartSeconds, trackLength, windowSeconds)
+      : bestWindowStart(curve, trackLength, windowSeconds);
+
+  const first = Math.floor(sectionStart / secondsPerBucket);
+  const count = Math.max(2, Math.round(windowSeconds / secondsPerBucket));
+  const section = curve.slice(first, first + count);
+  if (section.length < 2) return null;
+
+  const subLen = Math.max(1, Math.round(Math.max(1.5, windowSeconds * 0.2) / secondsPerBucket));
+  const bestSubStart = (buckets: number[]): number => {
+    const len = Math.min(subLen, buckets.length);
+    let running = 0;
+    for (let i = 0; i < len; i++) running += buckets[i];
+    let best = running;
+    let bestIndex = 0;
+    for (let i = len; i < buckets.length; i++) {
+      running += buckets[i] - buckets[i - len];
+      if (running > best) {
+        best = running;
+        bestIndex = i - len + 1;
+      }
+    }
+    return bestIndex;
+  };
+
+  let peakIndex = bestSubStart(section);
+  let clampedFromEnd = false;
+  const lastFifthStart = Math.floor(section.length * 0.8);
+  if (peakIndex >= lastFifthStart) {
+    peakIndex = bestSubStart(section.slice(0, lastFifthStart));
+    clampedFromEnd = true;
+  }
+
+  const peakOffsetSeconds = Math.round(peakIndex * secondsPerBucket * 100) / 100;
+  return {
+    sectionStartSeconds: Math.round(sectionStart * 100) / 100,
+    peakOffsetSeconds,
+    peakFraction: Math.min(1, Math.max(0, peakOffsetSeconds / windowSeconds)),
+    clampedFromEnd,
+    source: "waveform",
+  };
+}
+
 /**
  * Choose a start offset for a `windowSeconds`-long slice of a track.
  *

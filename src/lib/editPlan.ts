@@ -61,6 +61,12 @@ export interface EditPlanMusic {
    * synchronisation, and it should never be described as the latter.
    */
   beatIntervalSeconds: number | null;
+  /**
+   * Strongest sustained energy position within the chosen section, from the
+   * waveform. Null when no waveform analysis was possible. Recorded so a
+   * plan explains WHY the peak sits where it does.
+   */
+  energyPeakOffsetSeconds?: number | null;
 }
 
 export interface EditPlan {

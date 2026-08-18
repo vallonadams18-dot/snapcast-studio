@@ -37,6 +37,42 @@ export interface SelectionResult<T extends SelectionCandidate = SelectionCandida
   duplicatesFound: number;
 }
 
+/**
+ * Move the `peak` segment to sit where the music's energy peaks.
+ *
+ * Pure reorder: the same photos keep the same roles — only the peak's
+ * POSITION in the sequence changes, so 2A's selection logic is untouched.
+ * The target index is bounded to the middle of the sequence: never slot 0
+ * (the opener owns the hook) and never the last two (the hero owns the
+ * ending, and a peak jammed directly against it reads as two endings).
+ *
+ * `fraction` is the music peak's position within the section, 0..1. Energy
+ * analysis has already clamped a final-20% maximum to an earlier region, so
+ * an extreme value here still lands safely by construction AND by bounds.
+ *
+ * No-ops when the sequence is too short to have a middle, or has no peak.
+ */
+export function repositionPeak<T extends SelectionCandidate>(
+  selected: SelectedPhoto<T>[],
+  fraction: number,
+): SelectedPhoto<T>[] {
+  const n = selected.length;
+  if (n < 4) return selected;
+  const from = selected.findIndex((s) => s.role === "peak");
+  if (from < 0) return selected;
+
+  const target = Math.min(n - 3, Math.max(1, Math.round(fraction * (n - 1))));
+  if (target === from) return selected;
+
+  const out = [...selected];
+  const [peak] = out.splice(from, 1);
+  out.splice(target, 0, {
+    ...peak,
+    reason: "Strongest shot of the middle — placed at the music's energy peak",
+  });
+  return out;
+}
+
 /** Hashing costs one ffmpeg spawn each (~50ms); bound the work per render. */
 const MAX_HASH_CANDIDATES = 30;
 
