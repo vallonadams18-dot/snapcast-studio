@@ -226,31 +226,47 @@ export function MediaGrid({ media }: { media: GridMedia[] }) {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
           onClick={() => setLightbox(null)}
         >
-          <div className="flex max-h-full w-full max-w-md flex-col" onClick={(e) => e.stopPropagation()}>
+          {/* Scrolls INSIDE the modal. Without overflow-y-auto, max-h-full
+              just clipped the column at the viewport edge and anything below
+              — on a 768px laptop that was the whole trim panel including
+              Save — became unreachable, with no scrollbar to reveal it.
+              overscroll-contain stops the gesture chaining to the grid behind. */}
+          <div
+            className="flex max-h-full w-full max-w-md flex-col overflow-y-auto overscroll-contain"
+            onClick={(e) => e.stopPropagation()}
+          >
             {lightbox.mediaType === "video" ? (
               // Keyed on the URL: an edit writes a NEW file, and React would
               // otherwise reuse this element and keep playing the buffered
               // old one. Remounting guarantees the fresh file loads and
               // autoplays the moment a trim or music swap lands.
+              //
+              // 40dvh, not 80vh: the player shares this column with the
+              // buttons and the edit panel, and at 80vh it alone took 614px
+              // of a 768px screen. dvh rather than vh so mobile browser
+              // chrome is excluded instead of guessed at.
               <video
                 key={lightbox.sourceUrl}
                 ref={lightboxVideoRef}
                 src={lightbox.sourceUrl}
-                className="max-h-[80vh] w-full rounded-xl bg-black"
+                className="max-h-[40dvh] w-full shrink-0 rounded-xl bg-black"
                 controls
                 autoPlay
                 playsInline
               />
             ) : (
+              // A photo has no edit panel under it, so it can take more room.
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={lightbox.sourceUrl}
                 alt=""
-                className="max-h-[80vh] w-full rounded-xl object-contain"
+                className="max-h-[65dvh] w-full shrink-0 rounded-xl object-contain"
               />
             )}
 
-            <div className="mt-3 flex gap-2">
+            {/* shrink-0 throughout: in a scrolling flex column the default
+                would squash these controls instead of scrolling to them. */}
+            <div className="mt-3 flex shrink-0 gap-2">
               <a
                 href={lightbox.sourceUrl}
                 download

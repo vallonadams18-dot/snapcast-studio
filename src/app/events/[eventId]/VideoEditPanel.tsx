@@ -48,6 +48,7 @@ export function VideoEditPanel({
   const [musicOpen, setMusicOpen] = useState(false);
   const [mode, setMode] = useState<"closed" | "trim">("closed");
   const probeRef = useRef<HTMLVideoElement | null>(null);
+  const trimSectionRef = useRef<HTMLDivElement | null>(null);
 
   // Read the real duration from the file rather than trusting a stored
   // value — a video that's already been trimmed or had bookends added no
@@ -70,6 +71,17 @@ export function VideoEditPanel({
     else video.addEventListener("loadedmetadata", onMeta);
     return () => video.removeEventListener("loadedmetadata", onMeta);
   }, [mode, sourceUrl]);
+
+  // Opening the trim controls adds ~250px below the fold on a laptop. The
+  // modal scrolls now, but the sliders and Save should be in front of you
+  // without hunting for them.
+  useEffect(() => {
+    if (mode !== "trim") return;
+    const id = setTimeout(() => {
+      trimSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 50);
+    return () => clearTimeout(id);
+  }, [mode]);
 
   // Success messages shouldn't outlive the moment. Errors stay until the
   // next attempt, because they need acting on.
@@ -115,7 +127,7 @@ export function VideoEditPanel({
   const trimmedLength = Math.max(0, end - start);
 
   return (
-    <div className="mt-3 rounded-xl border border-neutral-700 bg-neutral-900 p-3">
+    <div className="mt-3 shrink-0 rounded-xl border border-neutral-700 bg-neutral-900 p-3">
       {/* Hidden probe element: reads duration metadata without showing a
           second copy of the video next to the lightbox player. Keyed on the
           URL so a new file gets a FRESH element — reusing it can report the
@@ -161,7 +173,7 @@ export function VideoEditPanel({
       )}
 
       {mode === "trim" && (
-        <div className="mt-3 border-t border-neutral-700 pt-3">
+        <div ref={trimSectionRef} className="mt-3 border-t border-neutral-700 pt-3">
           {duration === null ? (
             <p className="text-xs text-neutral-500">Reading video…</p>
           ) : (
