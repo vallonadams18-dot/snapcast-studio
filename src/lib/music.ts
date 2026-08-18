@@ -150,7 +150,13 @@ export async function searchLibrary(term: string, options: LibrarySearchOptions 
     throw new Error("No music library is connected. Add an Epidemic Sound API key to enable search.");
   }
 
-  const wantsVocals = options.vocals === "vocals";
+  // Vocals is the DEFAULT, not an opt-in. Event recaps are social videos and
+  // people expect songs, not underscore. The catalog skews the other way —
+  // roughly 8 of 20 unfiltered results have any vocals, and for "wedding" or
+  // "luxury" it is closer to 1 or 2 — so leaving this at "any" meant a wall
+  // of instrumentals no matter what was searched for.
+  const mode: NonNullable<LibrarySearchOptions["vocals"]> = options.vocals ?? "vocals";
+  const wantsVocals = mode === "vocals";
   // Ask for extra when we intend to filter locally, so narrowing doesn't
   // empty the list.
   const requested = Math.min(60, options.limit ?? 30);
@@ -186,13 +192,46 @@ export async function searchLibrary(term: string, options: LibrarySearchOptions 
   };
 
   let tracks = (data.tracks ?? []).map(toLibraryTrack);
-  if (options.vocals === "instrumental") tracks = tracks.filter((t) => !t.hasVocals);
+
+  if (mode === "instrumental") {
+    tracks = tracks.filter((t) => !t.hasVocals);
+  } else if (wantsVocals) {
+    // Below this, a "Vocals" search looks broken rather than selective.
+    const MIN_VOCAL_RESULTS = 8;
+    if (tracks.length < MIN_VOCAL_RESULTS) {
+      // Top up rather than hiding everything. Some searches genuinely have
+      // few sung tracks ("luxury" returns 1 of 20), and an almost-empty list
+      // is worse than a labelled mix — every row carries a VOCALS or
+      // INSTRUMENTAL badge, so the fallback is never passed off as a match.
+      const topUpParams = new URLSearchParams(params);
+      topUpParams.delete("vocalType");
+      const extra = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${topUpParams}`, {
+        headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+      })
+        .then((r) => (r.ok ? r.json() : { tracks: [] }))
+        .then((d: { tracks?: RawTrack[] }) => (d.tracks ?? []).map(toLibraryTrack))
+        .catch(() => [] as LibraryTrack[]);
+
+      const seen = new Set(tracks.map((t) => t.id));
+      tracks = [...tracks, ...extra.filter((t) => !seen.has(t.id))];
+    }
+    // Sung first, and a lead vocal ahead of backing, so the top of the list
+    // is always what was actually asked for.
+    tracks.sort((a, b) => vocalRank(b) - vocalRank(a));
+  }
 
   return {
     tracks,
     moods: (data.aggregations?.moods ?? []).slice(0, 14),
     genres: (data.aggregations?.genres ?? []).slice(0, 14),
   };
+}
+
+/** LEAD beats backing beats instrumental. */
+function vocalRank(t: LibraryTrack): number {
+  if (t.vocalType === "LEAD") return 3;
+  if (t.hasVocals) return 2;
+  return 0;
 }
 
 // Resolves a track's licensed MP3 URL. Used by the preview proxy so the API
@@ -211,13 +250,11 @@ export async function getTrackAudioUrl(trackId: string): Promise<string | null> 
   return url;
 }
 
-/** Categories where a sung track beats an instrumental one. */
-const PREFERS_VOCALS = new Set(["upbeat-pop", "high-energy-edm", "feel-good-indie"]);
-
 async function runEpidemicSearch(
   apiKey: string,
   params: URLSearchParams,
-  catalogId?: string,
+  /** When true, report no match rather than settling for instrumentals. */
+  requireVocals = false,
 ): Promise<EpidemicSearchResult | null> {
   const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
@@ -241,12 +278,23 @@ async function runEpidemicSearch(
   // energetic categories — the catalog skews heavily instrumental (typically
   // 8 of 20 results have vocals at all), so without this the upbeat styles
   // sound like background music.
+  // Vocals are preferred for EVERY category, not just the energetic ones.
+  // A wedding or corporate recap is still a social video, and a sung track
+  // is what makes it feel like content rather than a slideshow.
+  //
+  // Stepped rather than absolute: a lead vocal is best, backing vocals next,
+  // and only if neither leaves a real choice does it fall back to the whole
+  // pool — a thin result set must not collapse back to one fixed track.
   const pool = tracks.slice(0, 12);
-  const preferred = catalogId && PREFERS_VOCALS.has(catalogId) ? pool.filter((t) => t.hasVocals) : [];
-  // Only honour the preference if it leaves a real choice; otherwise a thin
-  // result set would collapse back to one deterministic track.
-  const candidates = preferred.length >= 3 ? preferred : pool;
+  const lead = pool.filter((t) => t.vocalType === "LEAD");
+  const anyVocals = pool.filter((t) => t.hasVocals);
+  // Let the caller try a broader query rather than accept an instrumental.
+  if (requireVocals && anyVocals.length === 0) return null;
+  const candidates = lead.length >= 2 ? lead : anyVocals.length >= 2 ? anyVocals : anyVocals.length > 0 ? anyVocals : pool;
   const track = candidates[Math.floor(Math.random() * candidates.length)];
+  console.log(
+    `[music] auto picked "${track.title}" hasVocals=${Boolean(track.hasVocals)} vocalType=${track.vocalType ?? "NONE"}`,
+  );
 
   return {
     id: track.id,
@@ -261,19 +309,34 @@ async function searchEpidemicTrack(catalogId: string): Promise<EpidemicSearchRes
   const query = EPIDEMIC_SEARCH[catalogId];
   if (!apiKey || !query) return null;
 
-  const filtered = new URLSearchParams({ term: query.term, limit: "20" });
-  if (query.mood) filtered.append("mood", query.mood);
-  if (query.genre) filtered.append("genre", query.genre);
+  // Vocals-first cascade. Each step relaxes one constraint, and only the
+  // last one accepts an instrumental.
+  //
+  // The narrow genre filters are what starve some categories of vocals:
+  // genre=corporate with "clean corporate motivational" is almost entirely
+  // underscore, so step 1 finds nothing sung and step 2 drops the genre
+  // while KEEPING the vocal requirement. The previous retry dropped both at
+  // once, which is why corporate recaps still came back instrumental.
+  const withFacets = new URLSearchParams({ term: query.term, limit: "20", vocalType: "LEAD" });
+  if (query.mood) withFacets.append("mood", query.mood);
+  if (query.genre) withFacets.append("genre", query.genre);
 
-  const result = await runEpidemicSearch(apiKey, filtered, catalogId);
-  if (result) return result;
+  const attempts: { params: URLSearchParams; requireVocals: boolean; label: string }[] = [
+    { params: withFacets, requireVocals: true, label: "term+facets+LEAD" },
+    {
+      params: new URLSearchParams({ term: query.term, limit: "20", vocalType: "LEAD" }),
+      requireVocals: true,
+      label: "term+LEAD",
+    },
+    // Last resort: whatever the category normally returns. Better an
+    // instrumental than silence.
+    { params: withFacets, requireVocals: false, label: "term+facets (instrumental ok)" },
+  ];
 
-  // An unrecognized mood/genre id silently returns zero results rather than
-  // erroring — retry on the search term alone so one bad filter combo never
-  // fully blocks music for that category.
-  if (query.mood || query.genre) {
-    console.error("[music] Filtered search empty for", catalogId, "— retrying on term alone");
-    return runEpidemicSearch(apiKey, new URLSearchParams({ term: query.term, limit: "20" }), catalogId);
+  for (const attempt of attempts) {
+    const result = await runEpidemicSearch(apiKey, attempt.params, attempt.requireVocals);
+    if (result) return result;
+    console.error(`[music] no match for ${catalogId} via ${attempt.label}`);
   }
   return null;
 }

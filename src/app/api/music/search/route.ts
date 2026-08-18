@@ -9,6 +9,7 @@ export async function GET(request: Request) {
   const account = await getCurrentAccount();
   if (!account) return NextResponse.json({ error: "not authenticated" }, { status: 401 });
 
+  // Default is VOCALS, not "any" — see searchLibrary.
   // Search is cheap but proxies a third-party API — keep one client from
   // hammering it with a keystroke-per-request UI bug.
   if (!rateLimit(`music-search:${account.id}`, 60, 60 * 1000)) {
@@ -22,9 +23,12 @@ export async function GET(request: Request) {
   const options: LibrarySearchOptions = {
     mood: url.searchParams.get("mood"),
     genre: url.searchParams.get("genre"),
+    // Defaults to VOCALS when unspecified. Event recaps are social videos;
+    // "any" returned a wall of instrumentals because that is what the
+    // catalog is mostly made of.
     vocals: (VOCAL_MODES as readonly string[]).includes(vocalsParam ?? "")
       ? (vocalsParam as LibrarySearchOptions["vocals"])
-      : "any",
+      : "vocals",
     limit: 40,
   };
 

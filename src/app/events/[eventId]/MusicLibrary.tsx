@@ -73,7 +73,7 @@ export function MusicLibrary({
   const [genreFacets, setGenreFacets] = useState<Facet[]>([]);
   const [mood, setMood] = useState<string | null>(null);
   const [genre, setGenre] = useState<string | null>(null);
-  const [vocals, setVocals] = useState<VocalMode>("any");
+  const [vocals, setVocals] = useState<VocalMode>("vocals");
   const [saved, setSaved] = useState<SavedTrack[]>([]);
   // Starts true: the sheet kicks off a search on mount, so rendering
   // "not loading" for the first frame would flash an empty-results message.
@@ -96,7 +96,9 @@ export function MusicLibrary({
       const params = new URLSearchParams({ q: term });
       if (opts.mood) params.set("mood", opts.mood);
       if (opts.genre) params.set("genre", opts.genre);
-      if (opts.vocals && opts.vocals !== "any") params.set("vocals", opts.vocals);
+      // Always sent, including "any". Omitting it means vocals-by-default on
+      // the server, which would make the All tab identical to the Vocals tab.
+      params.set("vocals", opts.vocals ?? "vocals");
       try {
         const res = await fetch(`/api/music/search?${params}`);
         const body = await res.json().catch(() => ({}));
@@ -120,7 +122,7 @@ export function MusicLibrary({
     (async () => {
       try {
         const [searchRes, savedRes] = await Promise.all([
-          fetch("/api/music/search?q=" + encodeURIComponent("event celebration")),
+          fetch("/api/music/search?vocals=vocals&q=" + encodeURIComponent("event celebration")),
           fetch("/api/music/saved"),
         ]);
         if (cancelled) return;
@@ -349,7 +351,7 @@ export function MusicLibrary({
               results have any vocals at all. */}
           <div className="mt-2 flex items-center gap-1">
             <span className="mr-1 text-[10px] uppercase tracking-wide text-neutral-500">Vocals</span>
-            {(["any", "vocals", "instrumental"] as VocalMode[]).map((v) => (
+            {(["vocals", "instrumental", "any"] as VocalMode[]).map((v) => (
               <button
                 key={v}
                 onClick={() => applyFacet({ vocals: v })}
@@ -448,11 +450,19 @@ export function MusicLibrary({
                   <button onClick={() => pickTrack(track)} className="min-w-0 flex-1 text-left">
                     <span className="block truncate text-sm font-medium text-foreground">
                       {track.title}
-                      {track.hasVocals && (
-                        <span className="ml-1.5 rounded bg-primary-purple/15 px-1 py-0.5 text-[9px] font-medium uppercase text-primary-purple">
-                          {track.vocalType === "LEAD" ? "vocals" : "backing"}
-                        </span>
-                      )}
+                      {/* Every row is labelled, not just the sung ones. When a
+                          thin "Vocals" search is topped up with instrumental
+                          fallbacks, they have to be obvious rather than
+                          quietly mixed in. */}
+                      <span
+                        className={`ml-1.5 rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                          track.hasVocals
+                            ? "bg-primary-pink/20 text-primary-pink"
+                            : "bg-neutral-500/20 text-neutral-400"
+                        }`}
+                      >
+                        {track.hasVocals ? (track.vocalType === "LEAD" ? "vocals" : "backing") : "instrumental"}
+                      </span>
                       {track.isExplicit && <span className="ml-1 text-[9px] text-neutral-500">E</span>}
                     </span>
                     <span className="block truncate text-[11px] text-neutral-500">
