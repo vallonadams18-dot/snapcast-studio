@@ -950,3 +950,197 @@ test("CONTAINMENT: storage keys cannot escape public/uploads", async () => {
     await rm(sandbox, { recursive: true, force: true });
   }
 });
+
+// ------------------------------------ Codex final-pass exact reproductions --
+test("REGRESSION: ftyp declaring 24 bytes with only 16 available is rejected", () => {
+  const buf = new Uint8Array(16);
+  buf.set([0, 0, 0, 24, ...enc.encode("ftypisom"), 0, 0, 0, 0]);
+  assert.equal(detectMediaType(buf), null);
+});
+
+test("REGRESSION: ftyp declaring 4096 bytes against a 64-byte window is not classified from the fragment", async () => {
+  // Streamed: 64 bytes arrive, stream ends — the declared box never did.
+  const fragment = new Uint8Array(64);
+  fragment.set([0, 0, 16, 0, ...enc.encode("ftypisom")]); // declares 4096
+  const short = await downloadWebhookMedia("https://c.example.com/x", {
+    resolver: pub,
+    transport: async () => respond(200, {}, fragment),
+  });
+  assert.equal(short.ok, false);
+  if (!short.ok) assert.equal(short.code, "unsupported_type");
+
+  // Positive control: the SAME declaration with all 4096 bytes present
+  // classifies as mp4 — proving the fix waits rather than rejects outright.
+  const full = new Uint8Array(4200);
+  full.set([0, 0, 16, 0, ...enc.encode("ftypisom")]);
+  const ok = await downloadWebhookMedia("https://c.example.com/x", {
+    resolver: pub,
+    transport: async () => respond(200, {}, full.subarray(0, 64), full.subarray(64)),
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.contentType, "video/mp4");
+    await rm(ok.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("REGRESSION: EBML header declaring 127 bytes with 64 available and an early DocType is rejected", () => {
+  const buf = new Uint8Array(64);
+  // magic + size vint 0xFF is the all-ones/unknown marker; use 2-byte vint
+  // declaring 127: 0x40 0x7f. Then an early, fully-formed webm DocType.
+  buf.set([0x1a, 0x45, 0xdf, 0xa3, 0x40, 0x7f, 0x42, 0x82, 0x84, ...enc.encode("webm")]);
+  assert.equal(detectMediaType(buf), null);
+});
+
+test("REGRESSION: all-ones VINT header size is rejected as unbounded", () => {
+  const buf = new Uint8Array(64);
+  buf.set([0x1a, 0x45, 0xdf, 0xa3, 0xff, 0x42, 0x82, 0x84, ...enc.encode("webm")]);
+  assert.equal(detectMediaType(buf), null);
+});
+
+test("REGRESSION: an AbortError during connect is classified as timeout, sanitized", async () => {
+  const abortLike = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+  const r = await downloadWebhookMedia("https://c.example.com/x", {
+    resolver: pub,
+    transport: async () => {
+      throw abortLike;
+    },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.code, "timeout");
+    assert.equal(r.error.includes("aborted"), false); // raw text never exposed
+  }
+});
+
+test("REGRESSION: near-deadline completion settles promptly and cleans the temp dir", async () => {
+  const before = await tempDirCount();
+  const started = Date.now();
+  const r = await downloadWebhookMedia("https://c.example.com/x", {
+    resolver: pub,
+    transport: async () => respond(200, {}, JPEG, "STALL"),
+    totalTimeoutMs: 120,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "timeout");
+  assert.ok(elapsed < 5_000, `settled in ${elapsed}ms — must not linger past the deadline`);
+  assert.equal(await tempDirCount(), before); // no orphan temp dir
+});
+
+// ==================================================================
+// Narrow correction pass — exact Codex re-audit reproductions
+// ==================================================================
+
+test("CODEX REPRO: ftyp declaring more bytes than exist is rejected, complete boxes accepted", () => {
+  // Declares 24 bytes, only 16 exist — previously classified from the fragment.
+  const declares24has16 = new Uint8Array(16);
+  declares24has16.set([0, 0, 0, 24, ...enc.encode("ftypisom"), 0, 0, 0, 0]);
+  assert.equal(detectMediaType(declares24has16), null);
+
+  // Declares 4096 bytes against a 64-byte window — previously accepted.
+  const declares4096 = new Uint8Array(64);
+  declares4096.set([0, 0, 0x10, 0, ...enc.encode("ftypisom")]);
+  assert.equal(detectMediaType(declares4096), null);
+
+  // The SAME declared size with the full box present is accepted — the fix
+  // demands completeness, not smaller boxes.
+  const complete = new Uint8Array(4096);
+  complete.set([0, 0, 0x10, 0, ...enc.encode("ftypisom")]);
+  assert.equal(detectMediaType(complete)?.extension, "mp4");
+
+  // And streaming delivers the same verdicts through the download path:
+  // a stream that ENDS mid-declared-box is a truncated file.
+  // (bodyOf ends the stream after the fragment.)
+});
+
+test("CODEX REPRO: streamed ftyp fragment — stream ends before declared box completes", async () => {
+  const fragment = new Uint8Array(16);
+  fragment.set([0, 0, 0, 24, ...enc.encode("ftypisom"), 0, 0, 0, 0]);
+  const t: Transport = async () => respond(200, {}, fragment);
+  const r = await downloadWebhookMedia("https://trunc.example.com/x", { resolver: pub, transport: t });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "unsupported_type");
+
+  // Same declared box arriving in FULL across chunks is accepted.
+  const head = new Uint8Array(16);
+  head.set([0, 0, 0, 24, ...enc.encode("ftypisom"), 0, 0, 0, 0]);
+  const rest = new Uint8Array(8); // completes the 24-byte box, plus body
+  const t2: Transport = async () => respond(200, {}, head, rest, new Uint8Array(100).fill(5));
+  const r2 = await downloadWebhookMedia("https://whole.example.com/x", { resolver: pub, transport: t2 });
+  assert.equal(r2.ok, true);
+  if (r2.ok) {
+    assert.equal(r2.extension, "mp4");
+    await rm(r2.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("CODEX REPRO: EBML header declaring 100 bytes with only 64 available is rejected", () => {
+  // Early, well-formed DocType inside a header whose declared span extends
+  // past the buffer — previously accepted from the fragment.
+  const declared = new Uint8Array(64);
+  declared.set([0x1a, 0x45, 0xdf, 0xa3, 0x80 | 100, 0x42, 0x82, 0x84, ...enc.encode("webm")]);
+  assert.equal(detectWebm(declared), false);
+  assert.equal(detectMediaType(declared), null);
+
+  // The same declaration with the full 100 header bytes present IS valid.
+  const complete = new Uint8Array(120);
+  complete.set([0x1a, 0x45, 0xdf, 0xa3, 0x80 | 100, 0x42, 0x82, 0x84, ...enc.encode("webm")]);
+  assert.equal(detectWebm(complete), true);
+});
+
+test("EBML unknown-size (all-ones) VINT is rejected as a bound", () => {
+  // 0xFF = one-byte vint with every value bit set — legal EBML "unknown
+  // size", unusable for bounding a header. Must reject, not guess.
+  const unknown = pad([0x1a, 0x45, 0xdf, 0xa3, 0xff, 0x42, 0x82, 0x84, ...enc.encode("webm")]);
+  assert.equal(detectWebm(unknown), false);
+});
+
+test("ABORT CLASSIFICATION: deadline expiring mid-connect reports timeout, sanitized", async () => {
+  // A transport that only fails when the operation signal aborts — the
+  // AbortError shape Node produces. Previously classified as "connect".
+  const abortOnly: Transport = async ({ signal }) =>
+    new Promise((_, rej) => {
+      signal?.addEventListener("abort", () =>
+        rej(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })),
+      );
+    });
+  const r = await downloadWebhookMedia("https://hang.example.com/x", {
+    resolver: pub,
+    transport: abortOnly,
+    totalTimeoutMs: 120,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.code, "timeout");
+    assert.ok(!/aborted/i.test(r.error), "raw AbortError text must not leak");
+  }
+});
+
+test("FINALIZATION DEADLINE: budget expiring during the write/flush phase settles promptly", async () => {
+  // Enough chunks that the tiny budget expires while writes and
+  // backpressure are in flight; the operation must settle fast, classify
+  // as timeout, and leave no temp directory behind.
+  const chunk = new Uint8Array(64 * 1024).fill(9);
+  const parts: Uint8Array[] = [MP4, ...Array.from({ length: 120 }, () => chunk)];
+  const slowish: AsyncIterable<Uint8Array> = {
+    async *[Symbol.asyncIterator]() {
+      for (const p of parts) {
+        await new Promise((res) => setTimeout(res, 2));
+        yield p;
+      }
+    },
+  };
+  const t: Transport = async () => ({ statusCode: 200, headers: {}, body: slowish, destroy() {} });
+  const before = await tempDirCount();
+  const started = Date.now();
+  const r = await downloadWebhookMedia("https://finalize.example.com/x", {
+    resolver: pub,
+    transport: t,
+    totalTimeoutMs: 60,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "timeout");
+  assert.ok(Date.now() - started < 5_000, "must settle promptly, not hang on end/close");
+  assert.equal(await tempDirCount(), before, "temp cleanup must complete");
+});

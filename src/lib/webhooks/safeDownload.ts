@@ -241,8 +241,22 @@ interface DetectedType {
   extension: string;
 }
 
-/** Identify a file from its leading bytes. Null = not an allowed media type. */
-export function detectMediaType(head: Uint8Array): DetectedType | null {
+/** Sniffing may buffer up to this much before classification must decide. */
+export const MAX_SNIFF_BYTES = 4096;
+
+export type HeadClassification = DetectedType | null | "insufficient";
+
+/**
+ * Identify a file from its leading bytes.
+ *
+ * Tri-state on purpose: "insufficient" tells the STREAMING caller that a
+ * structurally-declared region (an ftyp box, an EBML header) extends past
+ * the bytes seen so far and classification must wait for more. With
+ * `isFinal` — the stream has ended, or a plain buffer is being judged —
+ * insufficiency IS rejection: a file that ends before its own declared
+ * structure is truncated, not trusted.
+ */
+export function classifyMediaHead(head: Uint8Array, isFinal: boolean): HeadClassification {
   const ascii = (from: number, to: number) => String.fromCharCode(...head.subarray(from, to));
   if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
     return { kind: "photo", contentType: "image/jpeg", extension: "jpg" };
@@ -256,15 +270,19 @@ export function detectMediaType(head: Uint8Array): DetectedType | null {
   if (head.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") {
     return { kind: "photo", contentType: "image/webp", extension: "webp" };
   }
-  if (head.length >= 16 && ascii(4, 8) === "ftyp") {
+  if (head.length >= 8 && ascii(4, 8) === "ftyp") {
     // ISO-BMFF covers far more than video: HEIC/HEIF/AVIF images and M4A
     // audio are all `ftyp` containers too, and an unstructured read waved
-    // ftypheic through as video/mp4. The box itself is validated now: a
-    // 32-bit big-endian size that must at least hold the mandatory header
-    // (size + type + major + minor = 16 bytes), be 4-aligned, and be sane —
-    // a zero or absurd size is a crafted file, not a video.
+    // ftypheic through as video/mp4. The box is validated STRUCTURALLY:
+    // a sane, 4-aligned declared size that must hold the mandatory 16-byte
+    // header — and, critically, the DECLARED box must be fully present in
+    // the classification bytes. A box claiming 24 bytes in a 16-byte file,
+    // or 4096 bytes against a 64-byte window, was previously classified
+    // from the fragment; both are now refused until the whole box is seen.
+    if (head.length < 16) return isFinal ? null : "insufficient";
     const boxSize = (head[0] << 24) | (head[1] << 16) | (head[2] << 8) | head[3];
-    if (boxSize < 16 || boxSize > 4096 || boxSize % 4 !== 0) return null;
+    if (boxSize < 16 || boxSize > MAX_SNIFF_BYTES || boxSize % 4 !== 0) return null;
+    if (head.length < boxSize) return isFinal ? null : "insufficient";
     // Major brand is EXACT — "qt  " (two trailing spaces) is QuickTime;
     // startsWith("qt") also matched invented brands like "qtab".
     const brand = ascii(8, 12);
@@ -273,68 +291,97 @@ export function detectMediaType(head: Uint8Array): DetectedType | null {
     if (MP4_VIDEO_BRANDS.has(brand)) return { kind: "video", contentType: "video/mp4", extension: "mp4" };
     return null;
   }
-  if (head.length >= 5 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
-    return detectWebm(head) ? { kind: "video", contentType: "video/webm", extension: "webm" } : null;
+  if (head.length >= 4 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
+    const webm = classifyWebm(head);
+    if (webm === "insufficient") return isFinal ? null : "insufficient";
+    return webm ? { kind: "video", contentType: "video/webm", extension: "webm" } : null;
   }
   // Everything else — HTML, JSON, SVG/XML, PDF, archives, executables,
-  // formats we don't render — is rejected by not being recognised.
+  // formats we don't render — is rejected by not being recognised. Short
+  // unmatched heads may still grow into a signature mid-stream.
+  if (head.length < SNIFF_BYTES && !isFinal) return "insufficient";
   return null;
 }
 
+/** Buffer-level shim retaining the old boolean/null contract for callers
+ *  and tests judging a COMPLETE buffer. */
+export function detectMediaType(head: Uint8Array): DetectedType | null {
+  const c = classifyMediaHead(head, true);
+  return c === "insufficient" ? null : c;
+}
+
 /**
- * EBML variable-length integer at `pos`: leading zero bits of the first
- * byte give the width; the marker bit is masked out of the value. Null for
- * the invalid all-zero first byte or a vint running past the buffer.
+ * EBML variable-length integer at `pos`.
+ *
+ * Distinguishes three failure shapes because they mean different things to
+ * a streaming parser: "invalid" (no marker bit — corrupt, reject),
+ * "truncated" (the vint's own bytes run past the buffer — wait or reject),
+ * and the all-ones "unknown size" value, which is legal EBML but unusable
+ * for bounding a header, so this parser treats it as invalid.
  */
-function readVint(buf: Uint8Array, pos: number): { value: number; width: number } | null {
-  if (pos >= buf.length) return null;
+function readVint(
+  buf: Uint8Array,
+  pos: number,
+): { value: number; width: number } | "truncated" | "invalid" {
+  if (pos >= buf.length) return "truncated";
   const first = buf[pos];
-  if (first === 0) return null; // no marker bit — invalid vint
+  if (first === 0) return "invalid"; // no marker bit
   let width = 1;
   let mask = 0x80;
   while ((first & mask) === 0) {
     width += 1;
     mask >>= 1;
   }
-  if (pos + width > buf.length) return null; // truncated
+  if (pos + width > buf.length) return "truncated";
   let value = first & (mask - 1);
   for (let i = 1; i < width; i++) value = value * 256 + buf[pos + i];
+  // All value bits set = EBML "unknown size" — meaningless as a bound.
+  if (value === Math.pow(2, 7 * width) - 1) return "invalid";
   return { value, width };
 }
 
 /**
- * True only for a structurally valid EBML header whose DocType says webm.
+ * Structural WebM check over an EBML header.
  *
- * Parsed, not scanned: after the 4-byte EBML magic comes the header SIZE
- * vint, and the DocType element (ID 0x42 0x82) must sit INSIDE those
- * bounds, with its own valid size vint and its value fully present. A
- * Matroska DocType, an invalid vint, a truncated header, or the word
- * "webm" floating in unstructured bytes all fail — the previous
- * substring-scan accepted that last one.
+ * Parsed, not scanned — and the COMPLETE declared header must be present
+ * before anything is accepted. Previously an early DocType inside a header
+ * that declared 127 bytes with only 64 available was accepted from the
+ * fragment; now that case reports "insufficient" (reject when final) until
+ * the declared bytes actually exist. Invalid vints, the all-ones unknown
+ * size, elements overrunning the header, a Matroska DocType, and "webm"
+ * floating in unstructured bytes all fail.
  */
-export function detectWebm(head: Uint8Array): boolean {
+function classifyWebm(head: Uint8Array): boolean | "insufficient" {
   const headerSize = readVint(head, 4);
-  if (!headerSize) return false;
+  if (headerSize === "truncated") return "insufficient";
+  if (headerSize === "invalid") return false;
   const headerStart = 4 + headerSize.width;
   const headerEnd = headerStart + headerSize.value;
+  if (headerEnd > MAX_SNIFF_BYTES) return false; // absurd header for a real file
+  // The whole declared header must be on hand before any element is judged.
+  if (headerEnd > head.length) return "insufficient";
 
   let pos = headerStart;
   // Walk child elements: 2-byte element IDs in the EBML header space.
-  while (pos + 2 <= Math.min(headerEnd, head.length)) {
+  while (pos + 2 <= headerEnd) {
     const id = (head[pos] << 8) | head[pos + 1];
     const size = readVint(head, pos + 2);
-    if (!size) return false;
+    if (size === "truncated" || size === "invalid") return false; // header bytes are all present — this is corruption
     const valueStart = pos + 2 + size.width;
     const valueEnd = valueStart + size.value;
     if (valueEnd > headerEnd) return false; // element overruns the header
     if (id === 0x4282) {
-      if (valueEnd > head.length) return false; // DocType truncated
       const doctype = String.fromCharCode(...head.subarray(valueStart, valueEnd));
       return doctype === "webm";
     }
     pos = valueEnd;
   }
   return false; // no DocType inside the EBML header
+}
+
+/** Complete-buffer boolean wrapper, kept for tests and external callers. */
+export function detectWebm(head: Uint8Array): boolean {
+  return classifyWebm(head) === true;
 }
 
 // -------------------------------------------------------------- transport --
@@ -618,6 +665,10 @@ async function runDownload(
         "DNS resolution",
       );
     } catch {
+      // Honest limitation: dns.promises offers no cancellation, so an expired
+      // lookup keeps running in the background — but its result is discarded
+      // here and can never influence this operation: no pinned set is built
+      // and the download fails now.
       return { ok: false, code: "timeout", error: "DNS resolution timed out" };
     }
     if (!pinned.ok) return pinned;
@@ -649,12 +700,26 @@ async function runDownload(
         break;
       } catch (err) {
         lastError = err;
+        // LOW finding: when the ABSOLUTE deadline fired mid-connect/TLS/
+        // headers, the AbortError used to be classified as "connect". The
+        // operation ran out of time — say so, with a sanitized message.
+        if (signal.aborted) {
+          return { ok: false, code: "timeout", error: "download exceeded the total time limit" };
+        }
       }
     }
     if (!response) {
       // Static messages only: raw Node network errors embed addresses and
       // occasionally request paths, which must never reach logs or callers.
-      const timedOut = lastError instanceof Error && lastError.message.includes("timed out");
+      //
+      // Classification order matters: when the absolute deadline's signal
+      // has fired, the transport surfaces an AbortError whose message says
+      // nothing about time — reporting that as "connect" blamed the remote
+      // host for our own expired budget. The signal's state (and the
+      // AbortError name, for aborts that raced the flag) decides first.
+      const aborted =
+        signal.aborted || (lastError instanceof Error && lastError.name === "AbortError");
+      const timedOut = aborted || (lastError instanceof Error && lastError.message.includes("timed out"));
       return timedOut
         ? { ok: false, code: "timeout", error: "connection timed out" }
         : { ok: false, code: "connect", error: "could not connect to the media host" };
@@ -765,18 +830,28 @@ async function streamToTempFile(
 
       total += chunk.byteLength;
 
-      // Sniff the head once, as soon as enough bytes exist. Rejecting HTML
-      // or an unknown format costs at most SNIFF_BYTES of download.
+      // Classify from the head as soon as the structure allows. Tri-state:
+      // a declared ftyp box or EBML header larger than the bytes seen so
+      // far reports "insufficient" and buffering continues — up to
+      // MAX_SNIFF_BYTES, past which nothing legitimate is still undecided.
+      // Rejecting HTML or an unknown format still costs only a few bytes.
       if (!detected) {
-        const merged = new Uint8Array(Math.min(SNIFF_BYTES, sniff.length + chunk.byteLength));
+        const merged = new Uint8Array(Math.min(MAX_SNIFF_BYTES, sniff.length + chunk.byteLength));
         merged.set(sniff.subarray(0, Math.min(sniff.length, merged.length)));
         if (sniff.length < merged.length) {
           merged.set(chunk.subarray(0, merged.length - sniff.length), sniff.length);
         }
         sniff = merged;
-        if (sniff.length >= SNIFF_BYTES) {
-          detected = detectMediaType(sniff);
-          if (!detected) return await fail("unsupported_type", "file is not a supported image or video format");
+        const classified = classifyMediaHead(sniff, false);
+        if (classified === null) {
+          return await fail("unsupported_type", "file is not a supported image or video format");
+        }
+        if (classified === "insufficient") {
+          if (sniff.length >= MAX_SNIFF_BYTES) {
+            return await fail("unsupported_type", "file is not a supported image or video format");
+          }
+        } else {
+          detected = classified;
           const cap = detected.kind === "photo" ? limits.maxImage : limits.maxVideo;
           if (Number.isFinite(limits.declared) && limits.declared > cap) {
             return await fail("too_large", "declared size exceeds the limit for this media type");
@@ -791,31 +866,37 @@ async function streamToTempFile(
       if (fileError) return await fail("storage", "temp file write failed");
       const canWriteMore = file.write(Buffer.from(chunk));
       if (!canWriteMore) {
-        // One settle handler removes ALL of its rivals: a large download hits
-        // backpressure hundreds of times, and leaving the losers attached
-        // accumulates listeners until Node warns and closures pile up.
-        await new Promise<void>((res) => {
-          // Bounded by the absolute deadline too — a drain that never comes
-          // must not outlive the operation's budget. On expiry the loop's
-          // own deadline check performs the cleanup.
-          const guard = setTimeout(res, Math.max(1, Math.min(limits.idleMs, limits.deadline - Date.now())));
-          const settle = () => {
+        // ONE settle function owns every exit — drain, error, close, and the
+        // idle/deadline guard alike. Whichever fires first removes ALL of
+        // its rivals and clears the timer, so no listeners accumulate and no
+        // path can quietly keep writing after a timeout: a guard-timer win
+        // fails the download right here instead of allowing another write.
+        const reason = await new Promise<"settled" | "timeout">((res) => {
+          const onEvent = () => settle("settled");
+          const settle = (r: "settled" | "timeout") => {
             clearTimeout(guard);
-            file.off("drain", settle);
-            file.off("error", settle);
-            file.off("close", settle);
-            res();
+            file.off("drain", onEvent);
+            file.off("error", onEvent);
+            file.off("close", onEvent);
+            res(r);
           };
-          file.once("drain", settle);
+          const guard = setTimeout(
+            () => settle("timeout"),
+            Math.max(1, Math.min(limits.idleMs, limits.deadline - Date.now())),
+          );
+          file.once("drain", onEvent);
           // A stream that errors mid-backpressure never emits drain.
-          file.once("error", settle);
-          file.once("close", settle);
+          file.once("error", onEvent);
+          file.once("close", onEvent);
         });
+        if (reason === "timeout") return await fail("timeout", "download exceeded the total time limit");
       }
       if (fileError) return await fail("storage", "temp file write failed");
     }
 
-    // Streams shorter than the sniff window still get one classification try.
+    // The stream has ENDED: a final classification where insufficiency is
+    // rejection — a file that ends before its own declared structure is
+    // truncated, exactly the case that was previously waved through.
     if (!detected) {
       detected = detectMediaType(sniff);
       if (!detected) return await fail("unsupported_type", "file is not a supported image or video format");
@@ -824,9 +905,18 @@ async function streamToTempFile(
 
     // Success must await the CONFIRMED close, not merely "finish": the
     // storage adapter copies this file next, and an unflushed handle is a
-    // race on Windows in particular.
-    await new Promise<void>((res, rej) => file.end((err: unknown) => (err ? rej(err) : res())));
-    await fileClosed;
+    // race on Windows in particular. Finalization draws on the SAME absolute
+    // deadline as everything else — a flush that outlives the budget is
+    // destroyed and reported as a controlled timeout, never awaited forever.
+    const finalized = await Promise.race([
+      new Promise<"closed">((res, rej) =>
+        file.end((err: unknown) => (err ? rej(err) : fileClosed.then(() => res("closed")))),
+      ),
+      new Promise<"timeout">((res) =>
+        setTimeout(() => res("timeout"), Math.max(1, limits.deadline - Date.now())),
+      ),
+    ]);
+    if (finalized === "timeout") return await fail("timeout", "download exceeded the total time limit");
     if (fileError) return await fail("storage", "temp file write failed");
 
     return {
