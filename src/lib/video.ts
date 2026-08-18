@@ -49,6 +49,25 @@ export async function getVideoDurationSeconds(filePath: string): Promise<number>
   return Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds);
 }
 
+/**
+ * Frame rate of a rendered file, or null if it can't be read.
+ *
+ * Every h264 stage is supposed to deliver VIDEO_FPS. This exists so that can
+ * be checked at each step of the chain rather than only at the end, where a
+ * wrong rate says nothing about which stage introduced it.
+ */
+export async function getVideoFrameRate(filePath: string): Promise<number | null> {
+  let output = "";
+  try {
+    output = await runFfmpeg(["-i", filePath]);
+  } catch (err) {
+    // ffmpeg with no output file always "fails"; the stream info is in stderr.
+    output = err instanceof Error ? err.message : "";
+  }
+  const match = output.match(/,\s*([\d.]+)\s*fps\b/);
+  return match ? Number(match[1]) : null;
+}
+
 async function extractFrameAt(filePath: string, atSeconds: number, outputPath: string): Promise<void> {
   await runFfmpeg([
     "-ss", String(Math.max(0, atSeconds)),

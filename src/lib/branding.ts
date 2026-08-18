@@ -316,7 +316,19 @@ export async function applyWatermark(
     // file a client downloads — encode it at delivery quality with the moov
     // atom up front. Audio is copied, not re-encoded: it was already muxed by
     // the music step and a second aac pass would only lose more.
-    const videoOut = ["-c:v", "libx264", "-pix_fmt", "yuv420p", ...deliveryEncode(), "-c:a", "copy"];
+    // -r is REQUIRED here, not decoration. The logo is a still image, and
+    // ffmpeg's image demuxer defaults to 25fps; because scale2ref puts the
+    // logo chain first in the graph, the overlay output negotiated to the
+    // logo's 25 rather than the video's 30. Every earlier stage delivered 30
+    // and this one silently dropped it, so a watermarked montage shipped at
+    // 25fps — measured 30/30/30/25 across the pipeline before this line.
+    const videoOut = [
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      "-r", String(FPS),
+      ...deliveryEncode(),
+      "-c:a", "copy",
+    ];
     const photoOut = ["-q:v", "3"];
     const outArgs = kind === "video" ? videoOut : photoOut;
 

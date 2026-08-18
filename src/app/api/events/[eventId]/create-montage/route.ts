@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { createPhotoMontage, getVideoDurationSeconds } from "@/lib/video";
+import { createPhotoMontage, getVideoDurationSeconds, getVideoFrameRate } from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
@@ -168,6 +168,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     const totalDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
     // The SAME track object whose BPM shaped the pacing above.
+    // Frame-rate checkpoints. Every h264 stage is meant to deliver 30fps; a
+    // wrong rate at the end says nothing about which stage caused it.
+    const probeFps = async (label: string, buffer?: Buffer) => {
+      let target = montagePath;
+      if (buffer) {
+        target = path.join(tmpDir, `fps-${label}.mp4`);
+        await writeFile(target, buffer);
+      }
+      console.log(`[fps] ${label}: ${(await getVideoFrameRate(target).catch(() => null)) ?? "unknown"} fps`);
+    };
+    // The SAME track object whose BPM shaped the pacing above.
     const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration, null, null, track);
     console.log(
       `[music] planned with track=${track?.id ?? "none"} bpm=${track?.bpm ?? "unknown"} ` +
@@ -185,6 +196,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       );
       if (marked) montageBuffer = marked;
     }
+    await probeFps("4-finalDelivered", montageBuffer);
 
     // The opening shot doubles as the representative frame for caption and
     // score generation — no separate frame extraction needed. It is also the
