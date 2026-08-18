@@ -85,16 +85,19 @@ export async function POST(request: Request, { params }: { params: Promise<{ acc
   // Replaces a bare fetch(mediaUrl) that would happily GET the cloud
   // metadata endpoint or a 10.x address and buffer whatever came back.
   const download = await downloadWebhookMedia(mediaUrl, {
-    // HTTP only via an explicit opt-in, for local development against
-    // plain-http test servers. Never on by default.
-    allowHttp: process.env.WEBHOOK_ALLOW_INSECURE_HTTP === "1",
+    // HTTP only via an explicit opt-in AND outside production — the library
+    // additionally hard-blocks http whenever NODE_ENV is production, so no
+    // configuration can turn it on there.
+    allowHttp: process.env.NODE_ENV !== "production" && process.env.WEBHOOK_ALLOW_INSECURE_HTTP === "1",
   });
   if (!download.ok) {
     const clientFault =
       download.code === "url_invalid" || download.code === "url_policy" || download.code === "unsupported_type";
     // Safe log: code + origin host only. Never the full signed URL.
     console.error(`[webhook] download rejected account=${accountId} code=${download.code}`);
-    return NextResponse.json({ error: download.error }, { status: clientFault ? 400 : 502 });
+    // busy = transient server pressure, worth the sender's retry — 503.
+    const status = download.code === "busy" ? 503 : clientFault ? 400 : 502;
+    return NextResponse.json({ error: download.error }, { status });
   }
 
   try {

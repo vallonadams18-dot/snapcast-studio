@@ -36,7 +36,7 @@ const GIF = pad([...enc.encode("GIF89a")]);
 const WEBP = pad([...enc.encode("RIFF"), 0, 0, 0, 0, ...enc.encode("WEBP")]);
 const MP4 = pad([0, 0, 0, 24, ...enc.encode("ftypisom")]);
 const MOV = pad([0, 0, 0, 24, ...enc.encode("ftypqt  ")]);
-const WEBM = pad([0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x00, 0x00, 0x00, ...enc.encode("webmB")]);
+const WEBM = pad([0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x84, ...enc.encode("webm")]); // real DocType element
 
 function bodyOf(...parts: (Uint8Array | "STALL")[]): AsyncIterable<Uint8Array> {
   return {
@@ -398,4 +398,149 @@ test("local adapter saveFromFile copies then atomically renames into place", asy
     process.chdir(prevCwd);
     await rm(sandbox, { recursive: true, force: true });
   }
+});
+
+// ==================================================================
+// Codex review fixes — regression coverage
+// ==================================================================
+import { createServer } from "node:http";
+import { realTransport, MAX_CONCURRENT_DOWNLOADS, MAX_WAITING_DOWNLOADS } from "./safeDownload.ts";
+
+test("REAL SOCKET: Node 22 all:true lookup form works (the production breaker)", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/octet-stream" });
+    res.end(Buffer.from(JPEG));
+  });
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  try {
+    // Hostname (not IP literal) forces the lookup callback to run — on
+    // Node 22 with { all: true }, which the old callback answered wrongly,
+    // failing every hostname download with "Invalid IP address: undefined".
+    const response = await realTransport({
+      url: new URL(`http://localhost:${port}/media.jpg`),
+      address: { address: "127.0.0.1", family: 4 },
+    });
+    assert.equal(response.statusCode, 200);
+    const chunks: Uint8Array[] = [];
+    for await (const c of response.body) chunks.push(c);
+    assert.equal(Buffer.concat(chunks).length, JPEG.byteLength);
+  } finally {
+    server.close();
+  }
+});
+
+test("REAL SOCKET: connect timer is disarmed after connect — slow bodies survive", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200);
+    res.flushHeaders(); // writeHead alone buffers until first write
+    // Body arrives well AFTER the connect timeout — before the fix, the
+    // still-armed socket timer killed the stream at the connect timeout.
+    setTimeout(() => res.end(Buffer.from(MP4)), 700);
+  });
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const response = await realTransport({
+      url: new URL(`http://localhost:${port}/slow.mp4`),
+      address: { address: "127.0.0.1", family: 4 },
+      connectTimeoutMs: 250,
+    });
+    const chunks: Uint8Array[] = [];
+    for await (const c of response.body) chunks.push(c);
+    assert.equal(Buffer.concat(chunks).length, MP4.byteLength);
+  } finally {
+    server.close();
+  }
+});
+
+test("total budget covers DNS — a stalling resolver cannot outlive the deadline", async () => {
+  const stallingResolver: Resolver = () => new Promise(() => {});
+  const neverTransport: Transport = async () => {
+    throw new Error("must not be reached");
+  };
+  const r = await downloadWebhookMedia("https://slow-dns.example.com/x", {
+    resolver: stallingResolver,
+    transport: neverTransport,
+    totalTimeoutMs: 120,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "timeout");
+});
+
+test("resolved addresses are deduplicated and capped at 4 attempts", async () => {
+  const many: Resolver = async () => [
+    { address: "93.184.216.34", family: 4 },
+    { address: "93.184.216.34", family: 4 }, // duplicate
+    { address: "93.184.216.35", family: 4 },
+    { address: "93.184.216.36", family: 4 },
+    { address: "93.184.216.37", family: 4 },
+    { address: "93.184.216.38", family: 4 },
+    { address: "93.184.216.39", family: 4 },
+  ];
+  const dialed: string[] = [];
+  const alwaysFail: Transport = async ({ address }) => {
+    dialed.push(address.address);
+    throw new Error("ECONNREFUSED");
+  };
+  const r = await downloadWebhookMedia("https://multi.example.com/x", { resolver: many, transport: alwaysFail });
+  assert.equal(r.ok, false);
+  assert.equal(dialed.length, 4); // capped
+  assert.equal(new Set(dialed).size, 4); // deduplicated
+});
+
+test("production NODE_ENV hard-blocks http even with allowHttp", () => {
+  const prev = process.env.NODE_ENV;
+  try {
+    (process.env as Record<string, string>).NODE_ENV = "production";
+    assert.equal(validateMediaUrl("http://cdn.example.com/a.jpg", { allowHttp: true }).ok, false);
+  } finally {
+    (process.env as Record<string, string | undefined>).NODE_ENV = prev;
+  }
+});
+
+test("dev http ports: 80 and unprivileged allowed, privileged service ports blocked", () => {
+  assert.equal(validateMediaUrl("http://dev.example.com/a.jpg", { allowHttp: true }).ok, true); // 80
+  assert.equal(validateMediaUrl("http://dev.example.com:3000/a.jpg", { allowHttp: true }).ok, true);
+  assert.equal(validateMediaUrl("http://dev.example.com:6379/a.jpg", { allowHttp: true }).ok, true); // >=1024
+  assert.equal(validateMediaUrl("http://dev.example.com:25/a.jpg", { allowHttp: true }).ok, false); // SMTP
+  assert.equal(validateMediaUrl("http://dev.example.com:443/a.jpg", { allowHttp: true }).ok, false);
+});
+
+test("ISO-BMFF brand policy: HEIC/AVIF/M4A rejected, Matroska DocType rejected, truncated EBML rejected", () => {
+  const ftyp = (brand: string) => pad([0, 0, 0, 24, ...enc.encode("ftyp"), ...enc.encode(brand)]);
+  assert.equal(detectMediaType(ftyp("heic")), null);
+  assert.equal(detectMediaType(ftyp("heix")), null);
+  assert.equal(detectMediaType(ftyp("avif")), null);
+  assert.equal(detectMediaType(ftyp("mif1")), null);
+  assert.equal(detectMediaType(ftyp("M4A ")), null);
+  // Matroska: DocType element present but value is "matroska"
+  const mkv = pad([0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x88, ...enc.encode("matroska")]);
+  assert.equal(detectMediaType(mkv), null);
+  // Truncated EBML with no DocType at all
+  assert.equal(detectMediaType(pad([0x1a, 0x45, 0xdf, 0xa3])), null);
+  // Proper webm DocType still accepted
+  assert.deepEqual(detectMediaType(WEBM), { kind: "video", contentType: "video/webm", extension: "webm" });
+});
+
+test("concurrency: beyond active+queue capacity, downloads are refused as busy", async () => {
+  let releaseGate: () => void = () => {};
+  const gate = new Promise<void>((res) => (releaseGate = res));
+  const gatedTransport: Transport = async () => {
+    await gate;
+    return respond(200, {}, JPEG);
+  };
+  const total = MAX_CONCURRENT_DOWNLOADS + MAX_WAITING_DOWNLOADS + 1;
+  const runs = Array.from({ length: total }, () =>
+    downloadWebhookMedia("https://gated.example.com/x", { resolver: pub, transport: gatedTransport }),
+  );
+  // The overflow request must be refused promptly while the rest wait.
+  const first = await Promise.race([runs[total - 1], ...runs.slice(0, 3)]);
+  assert.equal(first.ok, false);
+  if (!first.ok) assert.equal(first.code, "busy");
+  releaseGate();
+  const settled = await Promise.all(runs);
+  const busy = settled.filter((r) => !r.ok && r.code === "busy");
+  assert.equal(busy.length, 1);
+  for (const r of settled) if (r.ok) await rm(r.tmpDir, { recursive: true, force: true });
 });

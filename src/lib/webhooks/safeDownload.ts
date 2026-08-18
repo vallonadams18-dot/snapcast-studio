@@ -46,7 +46,8 @@ export type SafeDownloadFailure = {
     | "timeout"
     | "too_large"
     | "unsupported_type"
-    | "storage";
+    | "storage"
+    | "busy";
   error: string;
 };
 
@@ -87,7 +88,18 @@ export function validateMediaUrl(raw: string, opts: UrlPolicyOptions = {}): { ok
   }
 
   if (url.protocol === "http:") {
-    if (!opts.allowHttp) return { ok: false, code: "url_policy", error: "media URL must use https" };
+    // Production can NEVER fetch over plain http — not even with the env
+    // opt-in set. The flag exists for local development against plain-http
+    // test servers, and it relaxes only the scheme, never the IP policy.
+    if (!opts.allowHttp || process.env.NODE_ENV === "production") {
+      return { ok: false, code: "url_policy", error: "media URL must use https" };
+    }
+    // Dev http is confined to port 80 or unprivileged ports — a dev server
+    // on :3000 works, but privileged service ports (25, 6379, …) do not.
+    const httpPort = url.port === "" ? 80 : Number(url.port);
+    if (httpPort !== 80 && httpPort < 1024) {
+      return { ok: false, code: "url_policy", error: "http port not allowed" };
+    }
   } else if (url.protocol !== "https:") {
     return { ok: false, code: "url_policy", error: "media URL must use https" };
   }
@@ -245,16 +257,30 @@ export function detectMediaType(head: Uint8Array): DetectedType | null {
     return { kind: "photo", contentType: "image/webp", extension: "webp" };
   }
   if (head.length >= 12 && ascii(4, 8) === "ftyp") {
+    // ISO-BMFF covers far more than video: HEIC/HEIF/AVIF images and M4A
+    // audio are all `ftyp` containers too. An explicit brand allowlist stops
+    // them from being waved through as video/mp4 — an independent probe
+    // confirmed `ftypheic` and `ftypavif` did exactly that before this.
     const brand = ascii(8, 12);
     if (brand.startsWith("qt")) return { kind: "video", contentType: "video/quicktime", extension: "mov" };
-    // isom / iso2 / mp41 / mp42 / avc1 / M4V and friends — the MP4 family.
-    return { kind: "video", contentType: "video/mp4", extension: "mp4" };
+    const MP4_VIDEO_BRANDS = new Set(["isom", "iso2", "iso4", "iso5", "iso6", "mp41", "mp42", "mp4v", "avc1", "dash", "M4V ", "M4VP"]);
+    if (MP4_VIDEO_BRANDS.has(brand)) return { kind: "video", contentType: "video/mp4", extension: "mp4" };
+    return null;
   }
   if (head.length >= 4 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
-    // EBML container. Only accept it when the DocType in the header says
-    // webm, so arbitrary Matroska doesn't ride in.
-    const headStr = ascii(0, Math.min(head.length, SNIFF_BYTES));
-    if (headStr.includes("webm")) return { kind: "video", contentType: "video/webm", extension: "webm" };
+    // EBML container. Accept only when the DocType ELEMENT (id 0x42 0x82)
+    // says "webm" — substring-scanning the header would let any Matroska
+    // file smuggle the word in. Light parse: find the element id, read its
+    // one-byte vint length, compare the value.
+    for (let i = 4; i < Math.min(head.length, SNIFF_BYTES) - 6; i++) {
+      if (head[i] === 0x42 && head[i + 1] === 0x82) {
+        const len = head[i + 2] & 0x7f;
+        const value = ascii(i + 3, i + 3 + len);
+        if (value === "webm") return { kind: "video", contentType: "video/webm", extension: "webm" };
+        return null; // DocType present and it isn't webm (e.g. matroska)
+      }
+    }
+    return null; // malformed/truncated EBML — no DocType found
   }
   // Everything else — HTML, JSON, SVG/XML, PDF, archives, executables,
   // formats we don't render — is rejected by not being recognised.
@@ -272,6 +298,9 @@ export interface TransportResponse {
 export type Transport = (target: {
   url: URL;
   address: ResolvedAddress;
+  /** Overridable so real-socket fixtures can run in test time, not wall time. */
+  connectTimeoutMs?: number;
+  headersTimeoutMs?: number;
 }) => Promise<TransportResponse>;
 
 /**
@@ -282,7 +311,7 @@ export type Transport = (target: {
  * address is checked against the pin, so even a hijacked lookup path can't
  * silently land elsewhere.
  */
-const realTransport: Transport = ({ url, address }) =>
+export const realTransport: Transport = ({ url, address, connectTimeoutMs = CONNECT_TIMEOUT_MS, headersTimeoutMs = HEADERS_TIMEOUT_MS }) =>
   new Promise<TransportResponse>((resolve, reject) => {
     const isHttps = url.protocol === "https:";
     const requestFn = isHttps ? httpsRequest : httpRequest;
@@ -296,10 +325,22 @@ const realTransport: Transport = ({ url, address }) =>
         method: "GET",
         // No cookies, no auth, no forwarded headers — ever.
         headers: { Accept: "image/*,video/*", "User-Agent": "Snapcast-Webhook/1.0" },
-        lookup: ((_host: string, _opts: unknown, cb: (err: Error | null, addr: string, fam: number) => void) => {
-          cb(null, address.address, address.family);
+        // Node's agent calls lookup in TWO forms, and on Node 22 the default
+        // is `{ all: true }`, which expects an ARRAY of address objects.
+        // Answering with the single-address form there yields
+        // "Invalid IP address: undefined" and every hostname download fails
+        // before connecting — found by an independent real-socket probe, not
+        // by the injected-transport tests. Both forms are now answered.
+        lookup: ((_host: string, options: { all?: boolean }, cb: (err: Error | null, ...rest: never[]) => void) => {
+          if (options && options.all) {
+            (cb as (e: Error | null, a: { address: string; family: number }[]) => void)(null, [
+              { address: address.address, family: address.family },
+            ]);
+          } else {
+            (cb as (e: Error | null, a: string, f: number) => void)(null, address.address, address.family);
+          }
         }) as never,
-        timeout: CONNECT_TIMEOUT_MS,
+        timeout: connectTimeoutMs,
       },
       (res) => {
         clearTimeout(headersTimer);
@@ -309,11 +350,18 @@ const realTransport: Transport = ({ url, address }) =>
         // classify as public.
         const normalizedRemote = remote.startsWith("::ffff:") ? remote.slice(7) : remote;
         const normalizedPin = address.address.startsWith("::ffff:") ? address.address.slice(7) : address.address;
-        if (normalizedRemote !== normalizedPin || !isPublicAddress(remote)) {
+        // Equality to the pin is the invariant — the pin was validated
+        // upstream, so matching it transfers that validation to the socket.
+        if (normalizedRemote !== normalizedPin) {
           res.destroy();
           reject(new Error("socket connected to an unexpected address"));
           return;
         }
+        // The `timeout` option is a SOCKET INACTIVITY timer, not a connect
+        // timer: left armed, it killed stalled BODIES at ~5s instead of the
+        // advertised 15s idle limit. Connected now — disarm it and let the
+        // consumer's idle timer own body inactivity.
+        res.socket?.setTimeout?.(0);
         resolve({
           statusCode: res.statusCode ?? 0,
           headers: res.headers,
@@ -325,7 +373,7 @@ const realTransport: Transport = ({ url, address }) =>
 
     const headersTimer = setTimeout(() => {
       req.destroy(new Error("response headers timed out"));
-    }, HEADERS_TIMEOUT_MS);
+    }, headersTimeoutMs);
 
     req.on("timeout", () => req.destroy(new Error("connect timed out")));
     req.on("error", (err) => {
@@ -360,24 +408,108 @@ export async function downloadWebhookMedia(rawUrl: string, opts: SafeDownloadOpt
   const maxVideo = opts.maxVideoBytes ?? MAX_VIDEO_BYTES;
   const idleMs = opts.idleTimeoutMs ?? IDLE_TIMEOUT_MS;
   const deadline = Date.now() + (opts.totalTimeoutMs ?? TOTAL_TIMEOUT_MS);
+  // The total budget covers EVERYTHING — DNS, every connect attempt, headers,
+  // every redirect hop, and the body. Before this it only policed the body
+  // loop, so hostile DNS plus slow connects across redirect hops could hold
+  // a request open well past the advertised limit.
+  const timeLeft = () => deadline - Date.now();
 
   const first = validateMediaUrl(rawUrl, opts);
   if (!first.ok) return first;
 
-  let current = first.url;
+  // Process-wide concurrency brake: the account quota allows a burst of 120
+  // authenticated requests a minute, and each one used to walk straight into
+  // a potentially-150MB download. A small semaphore keeps simultaneous
+  // downloads survivable on a 2GB box until WH-4 moves this to a worker.
+  const slot = await acquireDownloadSlot();
+  if (!slot) return { ok: false, code: "busy", error: "too many downloads in progress — retry shortly" };
+
+  try {
+    return await runDownload(first.url, { resolver, transport, maxImage, maxVideo, idleMs, deadline, timeLeft, opts });
+  } finally {
+    releaseDownloadSlot();
+  }
+}
+
+// Two active downloads, a short bounded queue, everything else refused.
+export const MAX_CONCURRENT_DOWNLOADS = 2;
+export const MAX_WAITING_DOWNLOADS = 8;
+let activeDownloads = 0;
+const waiters: (() => void)[] = [];
+
+async function acquireDownloadSlot(): Promise<boolean> {
+  if (activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
+    activeDownloads += 1;
+    return true;
+  }
+  if (waiters.length >= MAX_WAITING_DOWNLOADS) return false;
+  await new Promise<void>((resolve) => waiters.push(resolve));
+  activeDownloads += 1;
+  return true;
+}
+
+function releaseDownloadSlot(): void {
+  activeDownloads -= 1;
+  const next = waiters.shift();
+  if (next) next();
+}
+
+async function runDownload(
+  startUrl: URL,
+  ctx: {
+    resolver: Resolver;
+    transport: Transport;
+    maxImage: number;
+    maxVideo: number;
+    idleMs: number;
+    deadline: number;
+    timeLeft: () => number;
+    opts: SafeDownloadOptions;
+  },
+): Promise<SafeDownloadResult> {
+  const { resolver, transport, maxImage, maxVideo, idleMs, deadline, timeLeft, opts } = ctx;
+  let current = startUrl;
   let redirects = 0;
 
   for (;;) {
-    const pinned = await resolvePinnedAddresses(current, resolver);
+    if (timeLeft() <= 0) return { ok: false, code: "timeout", error: "download exceeded the total time limit" };
+
+    let pinned: Awaited<ReturnType<typeof resolvePinnedAddresses>>;
+    try {
+      pinned = await withTimeout(
+        resolvePinnedAddresses(current, resolver),
+        Math.min(DNS_TIMEOUT_MS, Math.max(1, timeLeft())),
+        "DNS resolution",
+      );
+    } catch {
+      return { ok: false, code: "timeout", error: "DNS resolution timed out" };
+    }
     if (!pinned.ok) return pinned;
 
     // Try validated addresses in order; a connect failure on one may fall
     // through to the next FROM THE SAME SNAPSHOT — never a fresh lookup.
+    // Deduplicated and capped: a hostile zone can return hundreds of
+    // records, and each is otherwise a fresh 5-second connect attempt.
+    const candidates: ResolvedAddress[] = [];
+    const seen = new Set<string>();
+    for (const a of pinned.addresses) {
+      if (!seen.has(a.address)) {
+        seen.add(a.address);
+        candidates.push(a);
+      }
+      if (candidates.length >= 4) break;
+    }
+
     let response: TransportResponse | null = null;
     let lastError: unknown = null;
-    for (const address of pinned.addresses) {
+    for (const address of candidates) {
+      if (timeLeft() <= 0) return { ok: false, code: "timeout", error: "download exceeded the total time limit" };
       try {
-        response = await transport({ url: current, address });
+        response = await withTimeout(
+          transport({ url: current, address }),
+          Math.min(CONNECT_TIMEOUT_MS + HEADERS_TIMEOUT_MS, Math.max(1, timeLeft())),
+          "connection attempt",
+        );
         break;
       } catch (err) {
         lastError = err;
@@ -449,8 +581,17 @@ async function streamToTempFile(
     response.destroy();
     // Wait for the handle to actually close before deleting: on Windows an
     // rm against an open file fails silently and would leak the temp dir.
+    // Must be safe for every stream state — open, errored, destroyed, or
+    // ALREADY closed: a closed stream never emits a second "close", so
+    // waiting for one unconditionally would hang this webhook forever. The
+    // timer is the last-resort escape for any state not covered.
     await new Promise<void>((res) => {
-      file.once("close", () => res());
+      if (file.closed) return res();
+      const timer = setTimeout(res, 500);
+      file.once("close", () => {
+        clearTimeout(timer);
+        res();
+      });
       file.destroy();
     });
     await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -501,12 +642,20 @@ async function streamToTempFile(
       if (fileError) return await fail("storage", "temp file write failed");
       const canWriteMore = file.write(Buffer.from(chunk));
       if (!canWriteMore) {
+        // One settle handler removes ALL of its rivals: a large download hits
+        // backpressure hundreds of times, and leaving the losers attached
+        // accumulates listeners until Node warns and closures pile up.
         await new Promise<void>((res) => {
-          const done = () => res();
-          file.once("drain", done);
+          const settle = () => {
+            file.off("drain", settle);
+            file.off("error", settle);
+            file.off("close", settle);
+            res();
+          };
+          file.once("drain", settle);
           // A stream that errors mid-backpressure never emits drain.
-          file.once("error", done);
-          file.once("close", done);
+          file.once("error", settle);
+          file.once("close", settle);
         });
       }
       if (fileError) return await fail("storage", "temp file write failed");

@@ -48,8 +48,10 @@ class LocalDiskAdapter implements StorageAdapter {
     // within one directory is atomic, so nginx can never serve a
     // half-written file, and a cross-device temp dir can't break the move.
     const staging = `${diskPath}.tmp-${Date.now()}`;
-    await copyFile(filePath, staging);
     try {
+      // Copy inside the try too: a disk-full failure mid-copy would
+      // otherwise strand a partial .tmp-* file forever.
+      await copyFile(filePath, staging);
       await rename(staging, diskPath);
     } catch (err) {
       await rm(staging, { force: true }).catch(() => {});
