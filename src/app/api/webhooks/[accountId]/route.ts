@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
+import { rm } from "node:fs/promises";
 import { readBoundedJsonBody, decodeUtf8Strict, verifyWebhookSignature } from "@/lib/webhooks/request";
+import { downloadWebhookMedia } from "@/lib/webhooks/safeDownload";
 import { prisma } from "@/lib/prisma";
 import { rateLimit } from "@/lib/rateLimit";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { mediaTypeForFile } from "@/lib/media";
 import { analyzeMedia, PLATFORMS } from "@/lib/ai";
 import { logUsageEvent } from "@/lib/usage";
 
@@ -78,53 +79,77 @@ export async function POST(request: Request, { params }: { params: Promise<{ acc
     return NextResponse.json({ error: "no active event found for this account" }, { status: 404 });
   }
 
-  let fetched: Response;
-  try {
-    fetched = await fetch(mediaUrl);
-    if (!fetched.ok) throw new Error();
-  } catch {
-    return NextResponse.json({ error: "could not download mediaUrl" }, { status: 502 });
+  // SSRF-safe streamed download: URL policy, public-IP-only DNS pinning at
+  // every hop, bounded redirects, magic-byte type detection, and per-type
+  // size caps counted on actual bytes — never buffered whole in memory.
+  // Replaces a bare fetch(mediaUrl) that would happily GET the cloud
+  // metadata endpoint or a 10.x address and buffer whatever came back.
+  const download = await downloadWebhookMedia(mediaUrl, {
+    // HTTP only via an explicit opt-in, for local development against
+    // plain-http test servers. Never on by default.
+    allowHttp: process.env.WEBHOOK_ALLOW_INSECURE_HTTP === "1",
+  });
+  if (!download.ok) {
+    const clientFault =
+      download.code === "url_invalid" || download.code === "url_policy" || download.code === "unsupported_type";
+    // Safe log: code + origin host only. Never the full signed URL.
+    console.error(`[webhook] download rejected account=${accountId} code=${download.code}`);
+    return NextResponse.json({ error: download.error }, { status: clientFault ? 400 : 502 });
   }
 
-  const contentType = fetched.headers.get("content-type") ?? "application/octet-stream";
-  const buffer = Buffer.from(await fetched.arrayBuffer());
-  const filename = mediaUrl.split("/").pop() ?? "upload";
-  const mediaType =
-    mediaTypeHint === "video" || contentType.startsWith("video/")
-      ? "video"
-      : mediaTypeForFile(new File([], filename, { type: contentType }));
+  try {
+    // The sender's own hint may not contradict what the bytes actually are —
+    // a "photo" that sniffs as video (or vice versa) is refused outright.
+    if (mediaTypeHint && mediaTypeHint !== download.kind && !(mediaTypeHint === "image" && download.kind === "photo")) {
+      return NextResponse.json(
+        { error: `payload says ${mediaTypeHint} but the file is a ${download.kind}` },
+        { status: 400 },
+      );
+    }
+    const mediaType = download.kind;
 
-  const key = randomFileKey(event.id, filename);
-  const saved = await getStorageAdapter().save(key, buffer, contentType);
+    // Local name comes from the DETECTED type — never from the remote URL.
+    const key = randomFileKey(event.id, `webhook.${download.extension}`);
+    const saved = await getStorageAdapter().saveFromFile(key, download.filePath, download.contentType, download.bytes);
+    console.log(
+      `[webhook] stored account=${accountId} event=${event.id} host=${download.hostname} ` +
+        `type=${download.contentType} bytes=${download.bytes} redirects=${download.redirects}`,
+    );
 
-  const media = await prisma.media.create({
-    data: {
-      accountId,
-      eventId: event.id,
-      mediaType,
-      storagePath: saved.storageRef,
-      sourceUrl: saved.url,
-      status: "ready",
-    },
-  });
-
-  // Same analysis path as a manual upload: scores land on the Media row and
-  // each platform gets its full set of caption variants.
-  const analysis = await analyzeMedia(media, event, account);
-  await prisma.media.update({ where: { id: media.id }, data: analysis.scores });
-  await logUsageEvent(accountId, "caption");
-  await prisma.draft.createMany({
-    data: PLATFORMS.flatMap((platform) =>
-      analysis.captions[platform].map((generatedCaption, variantIndex) => ({
+    const media = await prisma.media.create({
+      data: {
         accountId,
         eventId: event.id,
-        mediaId: media.id,
-        platform,
-        variantIndex,
-        generatedCaption,
-      })),
-    ),
-  });
+        mediaType,
+        storagePath: saved.storageRef,
+        sourceUrl: saved.url,
+        status: "ready",
+      },
+    });
 
-  return NextResponse.json({ ok: true, mediaId: media.id }, { status: 202 });
+    // Same analysis path as a manual upload: scores land on the Media row and
+    // each platform gets its full set of caption variants.
+    const analysis = await analyzeMedia(media, event, account);
+    await prisma.media.update({ where: { id: media.id }, data: analysis.scores });
+    await logUsageEvent(accountId, "caption");
+    await prisma.draft.createMany({
+      data: PLATFORMS.flatMap((platform) =>
+        analysis.captions[platform].map((generatedCaption, variantIndex) => ({
+          accountId,
+          eventId: event.id,
+          mediaId: media.id,
+          platform,
+          variantIndex,
+          generatedCaption,
+        })),
+      ),
+    });
+
+    return NextResponse.json({ ok: true, mediaId: media.id }, { status: 202 });
+  } finally {
+    // The downloader's temp dir is the caller's to clean, on every path out
+    // of this block — success, hint mismatch, storage failure, or analysis
+    // throwing. The stored copy (when one was made) lives elsewhere.
+    await rm(download.tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }

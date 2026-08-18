@@ -10,6 +10,12 @@ export interface SavedFile {
 export interface StorageAdapter {
   /** Saves a file under `key` (e.g. "<eventId>/<filename>"). */
   save(key: string, buffer: Buffer, contentType: string): Promise<SavedFile>;
+  /**
+   * Saves from a file already on disk, without buffering it in memory.
+   * Exists for the webhook downloader, which streams remote media to a temp
+   * file precisely so a 150MB video never has to live in a Buffer.
+   */
+  saveFromFile(key: string, filePath: string, contentType: string, contentLength: number): Promise<SavedFile>;
 }
 
 // Local disk — writes into public/uploads and returns a same-origin URL.
@@ -29,6 +35,26 @@ class LocalDiskAdapter implements StorageAdapter {
     const diskPath = path.join(process.cwd(), "public", "uploads", key);
     await mkdir(path.dirname(diskPath), { recursive: true });
     await writeFile(diskPath, buffer);
+    return { url: `/uploads/${key}`, storageRef: diskPath };
+  }
+
+  async saveFromFile(key: string, filePath: string): Promise<SavedFile> {
+    const { mkdir, copyFile, rename, rm } = await import("node:fs/promises");
+    const path = await import("node:path");
+
+    const diskPath = path.join(process.cwd(), "public", "uploads", key);
+    await mkdir(path.dirname(diskPath), { recursive: true });
+    // Copy into the FINAL directory first, then rename into place: rename
+    // within one directory is atomic, so nginx can never serve a
+    // half-written file, and a cross-device temp dir can't break the move.
+    const staging = `${diskPath}.tmp-${Date.now()}`;
+    await copyFile(filePath, staging);
+    try {
+      await rename(staging, diskPath);
+    } catch (err) {
+      await rm(staging, { force: true }).catch(() => {});
+      throw err;
+    }
     return { url: `/uploads/${key}`, storageRef: diskPath };
   }
 }
@@ -58,6 +84,41 @@ class S3CompatibleAdapter implements StorageAdapter {
 
     await client.send(
       new PutObjectCommand({ Bucket: bucket, Key: key, Body: buffer, ContentType: contentType }),
+    );
+
+    const url = `${publicBaseUrl.replace(/\/$/, "")}/${key}`;
+    return { url, storageRef: url };
+  }
+
+  async saveFromFile(key: string, filePath: string, contentType: string, contentLength: number): Promise<SavedFile> {
+    const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
+    const { createReadStream } = await import("node:fs");
+
+    const bucket = process.env.STORAGE_S3_BUCKET;
+    const publicBaseUrl = process.env.STORAGE_S3_PUBLIC_URL;
+    if (!bucket || !publicBaseUrl) {
+      throw new Error("STORAGE_S3_BUCKET and STORAGE_S3_PUBLIC_URL are required when STORAGE_PROVIDER=s3");
+    }
+
+    const client = new S3Client({
+      region: process.env.STORAGE_S3_REGION || "auto",
+      endpoint: process.env.STORAGE_S3_ENDPOINT,
+      credentials: {
+        accessKeyId: process.env.STORAGE_S3_ACCESS_KEY_ID ?? "",
+        secretAccessKey: process.env.STORAGE_S3_SECRET_ACCESS_KEY ?? "",
+      },
+    });
+
+    // Streamed body with an explicit length — S3 requires ContentLength for
+    // unseekable streams, and we know it exactly from the counted download.
+    await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: createReadStream(filePath),
+        ContentType: contentType,
+        ContentLength: contentLength,
+      }),
     );
 
     const url = `${publicBaseUrl.replace(/\/$/, "")}/${key}`;

@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:webhooks": "node --experimental-strip-types --test src/lib/webhooks/request.test.ts"
+    "test:webhooks": "node --experimental-strip-types --test src/lib/webhooks/request.test.ts src/lib/webhooks/safeDownload.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
@@ -16,6 +16,7 @@
     "@prisma/client": "7.9.1",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
+    "ipaddr.js": "^2.5.0",
     "next": "16.3.1",
     "prisma": "7.9.1",
     "react": "19.2.8",
