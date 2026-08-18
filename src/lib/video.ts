@@ -356,9 +356,15 @@ function fixed(value: number): string {
 // has no accumulated state to seed.) Constant-velocity motion is the single
 // biggest "screensaver" tell; easing is what makes a move feel operated.
 
-/** Eased progress 0→1 as a filtergraph expression. `span` = frames - 1. */
-function easedProgress(easing: EditSegment["easing"], span: number): string {
-  const p = `(on/${span})`;
+/**
+ * Eased progress 0→1 over an arbitrary progress expression. `p` is the raw
+ * linear progress term — `(on/span)` in zoompan's frame domain, `(t/T)` in
+ * rotate's time domain — so ONE easing definition drives every moving layer.
+ * That is what makes "settle" actually settle: foreground, parallax
+ * backdrop and rotation all read the same curve, and when it flattens at
+ * 85% the WHOLE composition rests, not just the photo layer.
+ */
+function easedOf(easing: EditSegment["easing"], p: string): string {
   const easeInOutOf = (q: string) => `if(lt(${q},0.5),2*${q}*${q},1-pow(-2*${q}+2,2)/2)`;
   switch (easing) {
     case "linear":
@@ -378,6 +384,11 @@ function easedProgress(easing: EditSegment["easing"], span: number): string {
       // instead of mid-drift.
       return `if(gte(${p},0.85),1,${easeInOutOf(`(${p}/0.85)`)})`;
   }
+}
+
+/** Eased progress in zoompan's frame domain. `span` = frames - 1. */
+function easedProgress(easing: EditSegment["easing"], span: number): string {
+  return easedOf(easing, `(on/${span})`);
 }
 
 /** One zoompan filter executing the segment's move at the given magnitude. */
@@ -438,12 +449,13 @@ function gradeChain(look: EditPlan["look"]): string {
  * ~10% first so the rotated corners never reveal the edge; at the 2.5° the
  * Party preset uses, the required margin is ~46px against 54px available.
  */
-function rotateChain(degrees: number, durationSeconds: number): string {
+function rotateChain(degrees: number, durationSeconds: number, easing: EditSegment["easing"]): string {
   const d = fixed((degrees * Math.PI) / 180);
-  return (
-    `scale=1188:2112,rotate='(-${d})+2*${d}*t/${fixed(Math.max(0.1, durationSeconds))}':ow=1188:oh=2112:c=black,` +
-    `crop=1080:1920`
-  );
+  // Rotation reads the same easing curve as every other layer, in rotate's
+  // time domain — a settling hero stops turning at 85% too. A linear t/T
+  // here kept the composite rotating through the final frame.
+  const E = easedOf(easing, `(t/${fixed(Math.max(0.1, durationSeconds))})`);
+  return `scale=1188:2112,rotate='(-${d})+2*${d}*${E}':ow=1188:oh=2112:c=black,crop=1080:1920`;
 }
 
 // Fits the photo into a 9:16 frame WITHOUT cropping the subject out: the
@@ -466,13 +478,16 @@ const BLURRED_FIT_FILTER = [
  */
 function parallaxGraph(segment: EditSegment, frameCount: number, motion: string): string {
   const span = Math.max(1, frameCount - 1);
-  const linearE = `(on/${span})`;
+  // The backdrop follows the SEGMENT'S OWN easing at its smaller magnitude —
+  // previously it pushed linearly regardless, so a settling hero rested its
+  // photo while the blurred backdrop kept crawling through the loop frame.
+  const bgE = easedProgress(segment.easing, span);
   const bgM = fixed(Math.min(0.3, segment.bgMagnitude));
   const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
   const centre = ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'";
   return [
     `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=32,` +
-      `zoompan=z='1+${bgM}*${linearE}'${centre}${size}[bg]`,
+      `zoompan=z='1+${bgM}*${bgE}'${centre}${size}[bg]`,
     `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
       `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0.0,format=rgba,${motion}[fg]`,
     `[bg][fg]overlay=(W-w)/2:(H-h)/2`,
@@ -488,7 +503,7 @@ async function createPhotoSegment(segment: EditSegment, plan: EditPlan, outputPa
   const frameCount = Math.max(2, Math.round(segment.durationSeconds * VIDEO_FPS));
   const motion = motionFilter(segment.motion, frameCount, segment.motionMagnitude, segment.easing);
   const grade = gradeChain(plan.look);
-  const rotate = segment.rotateDriftDegrees > 0 ? rotateChain(segment.rotateDriftDegrees, segment.durationSeconds) : null;
+  const rotate = segment.rotateDriftDegrees > 0 ? rotateChain(segment.rotateDriftDegrees, segment.durationSeconds, segment.easing) : null;
 
   const inputArgs = ["-loop", "1", "-i", segment.sourcePath, "-t", String(segment.durationSeconds)];
   // Intermediate quality: this segment gets re-encoded at least once more

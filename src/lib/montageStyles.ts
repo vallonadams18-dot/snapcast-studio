@@ -177,7 +177,7 @@ export const MONTAGE_STYLES: MontageStyle[] = [
     baseTransition: { kind: "fade", seconds: 0.9 },
     signatureTransition: { kind: "fadeblack", seconds: 0.9 },
     accentBudget: 0,
-    look: { saturation: 0.95, contrast: 1.06, vignette: 0.3, grain: 0.05 },
+    look: { saturation: 0.95, contrast: 1.06, vignette: 0.3, grain: 0.01 },
   },
   {
     id: "party",
@@ -259,10 +259,15 @@ export function chooseAutoPreset(signals: AutoPresetSignals): { style: MontageSt
   if (eventType === "corporate") {
     return { style: getMontageStyle("luxury"), reason: "corporate event — clean, restrained treatment" };
   }
+  // Event type outranks tempo — a 130 BPM birthday is still a birthday, the
+  // same way wedding and corporate override the track above.
+  if (eventType === "birthday") {
+    return { style: getMontageStyle("party"), reason: "birthday event — playful treatment" };
+  }
   if (bpm !== null && bpm >= 118) {
     return { style: getMontageStyle("hype"), reason: `fast track (${bpm} BPM) — high-energy treatment` };
   }
-  if (eventType === "birthday" || (bpm !== null && bpm >= 100)) {
+  if (bpm !== null && bpm >= 100) {
     return {
       style: getMontageStyle("party"),
       reason: bpm !== null ? `upbeat track (${bpm} BPM) — playful treatment` : "birthday event — playful treatment",

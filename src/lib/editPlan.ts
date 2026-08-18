@@ -368,7 +368,12 @@ export function describeEditPlan(plan: EditPlan): string {
     `[plan v${plan.planVersion}] preset=${plan.presetName} · ${plan.segments.length} segments · ` +
     `~${plan.targetDurationSeconds.toFixed(1)}s · look sat=${plan.look.saturation} con=${plan.look.contrast} ` +
     `vig=${plan.look.vignette} grain=${plan.look.grain} · ${plan.duplicatesFound} near-duplicates skipped` +
-    (plan.music ? ` · music=${plan.music.title ?? plan.music.catalogId}` : " · no music");
+    (plan.music
+      ? ` · music=${plan.music.title ?? plan.music.catalogId}` +
+        (plan.music.bpm ? ` ${plan.music.bpm}bpm` : "") +
+        (plan.music.startSeconds !== null ? ` from ${plan.music.startSeconds}s` : "") +
+        (plan.music.energyPeakOffsetSeconds != null ? ` peak +${plan.music.energyPeakOffsetSeconds}s` : "")
+      : " · no music");
 
   const rows = plan.segments.map((s, i) => {
     const move =

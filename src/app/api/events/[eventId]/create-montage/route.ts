@@ -124,12 +124,39 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     const track = await resolveTrackForCategory(suggestedTrack).catch(() => null);
     const beatIntervalSeconds = track?.bpm ? 60 / track.bpm : null;
 
+    // Resolve "auto" to ONE concrete preset BEFORE any music analysis: the
+    // energy window is derived from the preset's real pacing, and Auto's
+    // 2.8s placeholder analysed a section up to twice the montage's actual
+    // length when Hype (1.4s/photo) was then chosen — the picked peak could
+    // sit outside the audio that ends up in the video. The heuristic only
+    // needs event type, BPM and the photo set, all of which exist here.
+    let style = requestedStyle;
+    if (requestedStyle.id === "auto") {
+      const scores = selection.selected.map(
+        (s) =>
+          (s.candidate.energyScore ?? 0) +
+          (s.candidate.visualQualityScore ?? 0) +
+          (s.candidate.momentRarityScore ?? 0),
+      );
+      const mean = scores.reduce((a, b) => a + b, 0) / Math.max(1, scores.length);
+      const scoreVariance = scores.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, scores.length);
+      const auto = chooseAutoPreset({
+        eventType: event.eventType,
+        bpm: track?.bpm ?? null,
+        energyPeakFraction: null,
+        photoCount: selection.selected.length,
+        scoreVariance,
+      });
+      style = auto.style;
+      console.log(`[preset] AI Auto chose ${style.name} — ${auto.reason}`);
+    }
+
     // Find where the music's energy peaks inside the section we'll use, so
     // the strongest VISUAL moment can sit on the strongest AUDIO moment.
     // Waveform-only — needs no audio download, so the 402 doesn't block it.
-    // The estimate of the section length is fine here: this chooses a loud
-    // neighbourhood, not a frame-accurate cue.
-    const estimatedLength = selection.selected.length * requestedStyle.secondsPerPhoto;
+    // The window length now comes from the CONCRETE preset's pacing, never
+    // the auto placeholder.
+    const estimatedLength = selection.selected.length * style.secondsPerPhoto;
     const energy = await analyzeSectionEnergy({
       waveformUrl: track?.waveformUrl,
       trackLengthSeconds: track?.lengthSeconds,
@@ -146,30 +173,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
         `[music] energy peak at +${energy.peakOffsetSeconds}s of section starting ${energy.sectionStartSeconds}s` +
           (energy.clampedFromEnd ? " (raw max was in the final 20% — clamped earlier)" : ""),
       );
-    }
-
-    // Resolve "auto" to ONE concrete preset now that its inputs exist: the
-    // event type, the resolved track BPM, the analysed energy shape, and the
-    // photo set. One coherent visual language — never a blend.
-    let style = requestedStyle;
-    if (requestedStyle.id === "auto") {
-      const scores = selection.selected.map(
-        (s) =>
-          (s.candidate.energyScore ?? 0) +
-          (s.candidate.visualQualityScore ?? 0) +
-          (s.candidate.momentRarityScore ?? 0),
-      );
-      const mean = scores.reduce((a, b) => a + b, 0) / Math.max(1, scores.length);
-      const scoreVariance = scores.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, scores.length);
-      const auto = chooseAutoPreset({
-        eventType: event.eventType,
-        bpm: track?.bpm ?? null,
-        energyPeakFraction: energy?.peakFraction ?? null,
-        photoCount: selection.selected.length,
-        scoreVariance,
-      });
-      style = auto.style;
-      console.log(`[preset] AI Auto chose ${style.name} — ${auto.reason}`);
     }
 
     // The creative decisions are all made here, and settled before ffmpeg is
