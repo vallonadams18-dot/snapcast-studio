@@ -22,16 +22,20 @@ fi
 
 cd "$APP_DIR"
 
-echo "==> Pulling latest code"
-# git refuses to operate on a repo owned by another user unless told it's ok.
-git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
-git pull --ff-only
-
-# Everything below writes into the app dir, so it runs as the app user to
-# avoid leaving root-owned files the service can't read later.
+# Everything that writes into the app dir runs as the app user. That
+# INCLUDES the git pull: a pull run as root writes any changed files as
+# root-owned, and the first deploy that touched package-lock.json then
+# failed with EACCES when the app user ran npm install. Ownership is also
+# repaired first, to heal trees damaged by earlier root pulls.
 run_as_app() {
   su -s /bin/bash "$APP_USER" -c "cd '$APP_DIR' && $1"
 }
+
+echo "==> Fixing ownership"
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+
+echo "==> Pulling latest code"
+run_as_app "git pull --ff-only"
 
 echo "==> Installing dependencies"
 run_as_app "npm install"
