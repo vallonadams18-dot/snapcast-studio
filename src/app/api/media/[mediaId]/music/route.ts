@@ -44,27 +44,39 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
   let sourceUrl = media.sourceUrl;
   let mixed = false;
 
+  // Only GENERATED media gets its audio replaced: a cut clip (which carries a
+  // time range) or a photo montage (which carries its source ids). A raw
+  // upload is the client's own footage and is never overwritten — mixing a
+  // track into it would re-encode and permanently replace their original.
+  const isGenerated =
+    media.mediaType === "video" &&
+    ((media.clipStartSeconds !== null && media.clipEndSeconds !== null) || media.compiledFromMediaIds !== null);
+
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-music-swap-"));
   try {
-    if (media.mediaType === "video") {
-      const original = await getMediaBytes(media);
+    if (isGenerated) {
+      // Everything from reading the bytes onward is inside this catch. A
+      // missing or unreadable file must degrade to recording the client's
+      // track choice, exactly as it did before — never a 500 that reads to
+      // them as "the editor is broken".
+      try {
+        const original = await getMediaBytes(media);
 
-      // Measure the file itself.
-      //
-      // This used to derive a duration from montage metadata — photo count
-      // multiplied by the DEFAULT style's seconds-per-photo — which was
-      // wrong for every style except cinematic and ignored transition
-      // overlap entirely. An 8-photo "punchy" montage really runs ~11s but
-      // was computed as 25.6s, so the swapped track kept playing for about
-      // fourteen seconds after the picture had ended.
-      //
-      // The rendered file already knows its own length. Ask it.
-      const probePath = path.join(tmpDir, "current.mp4");
-      await writeFile(probePath, original);
-      const duration = await getVideoDurationSeconds(probePath).catch(() => null);
+        // Measure the file itself.
+        //
+        // This used to derive a duration from montage metadata — photo count
+        // multiplied by the DEFAULT style's seconds-per-photo — which was
+        // wrong for every style except cinematic and ignored transition
+        // overlap entirely. An 8-photo "punchy" montage really runs ~11s but
+        // was computed as 25.6s, so the swapped track kept playing for about
+        // fourteen seconds after the picture had ended.
+        //
+        // The rendered file already knows its own length. Ask it.
+        const probePath = path.join(tmpDir, "current.mp4");
+        await writeFile(probePath, original);
+        const duration = await getVideoDurationSeconds(probePath).catch(() => null);
 
-      if (duration !== null && duration > 0) {
-        try {
+        if (duration !== null && duration > 0) {
           const result = await mixTrackIntoClip(
             original,
             trackId ?? media.musicTrack ?? "cinematic",
@@ -81,11 +93,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ med
             sourceUrl = saved.url;
             mixed = true;
           }
-        } catch (err) {
-          console.error("[music] Track swap mix failed, keeping tag-only", err);
+        } else {
+          console.error("[music] Could not measure media duration, keeping tag-only", mediaId);
         }
-      } else {
-        console.error("[music] Could not measure media duration, keeping tag-only", mediaId);
+      } catch (err) {
+        console.error("[music] Track swap mix failed, keeping tag-only", err);
       }
     }
   } finally {

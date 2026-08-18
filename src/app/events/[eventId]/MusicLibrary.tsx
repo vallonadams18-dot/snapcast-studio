@@ -52,7 +52,12 @@ export function MusicLibrary({
   clipDurationSeconds: number;
   currentTrackTitle: string | null;
   onClose: () => void;
-  onApplied: () => void;
+  /**
+   * Receives what the server actually did, so the caller can refresh the
+   * player in place and report honestly — `mixed: false` means the track
+   * choice was recorded but the audio was left alone.
+   */
+  onApplied: (result: { sourceUrl: string; musicTrackTitle: string | null; mixed: boolean }) => void;
 }) {
   const [query, setQuery] = useState("");
   const [tracks, setTracks] = useState<LibraryTrack[]>([]);
@@ -214,7 +219,13 @@ export function MusicLibrary({
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Couldn't apply that track.");
-      onApplied();
+      onApplied({
+        sourceUrl: body.sourceUrl,
+        musicTrackTitle: body.musicTrackTitle ?? null,
+        mixed: Boolean(body.mixed),
+      });
+      // Closes this sheet only. The editor behind it stays open so the
+      // updated video can be watched straight away.
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't apply that track.");

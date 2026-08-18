@@ -228,7 +228,12 @@ export function MediaGrid({ media }: { media: GridMedia[] }) {
         >
           <div className="flex max-h-full w-full max-w-md flex-col" onClick={(e) => e.stopPropagation()}>
             {lightbox.mediaType === "video" ? (
+              // Keyed on the URL: an edit writes a NEW file, and React would
+              // otherwise reuse this element and keep playing the buffered
+              // old one. Remounting guarantees the fresh file loads and
+              // autoplays the moment a trim or music swap lands.
               <video
+                key={lightbox.sourceUrl}
                 ref={lightboxVideoRef}
                 src={lightbox.sourceUrl}
                 className="max-h-[80vh] w-full rounded-xl bg-black"
@@ -269,7 +274,13 @@ export function MediaGrid({ media }: { media: GridMedia[] }) {
                 mediaId={lightbox.id}
                 sourceUrl={lightbox.sourceUrl}
                 currentTrackTitle={lightbox.musicTrackTitle}
-                onChanged={() => setLightbox(null)}
+                isGenerated={Boolean(lightbox.sourceMediaId || lightbox.compiledFromMediaIds)}
+                // Swap the new file into the open player instead of closing.
+                // Closing after a successful edit was indistinguishable from
+                // the edit having done nothing at all.
+                onUpdated={(update) =>
+                  setLightbox((prev) => (prev ? { ...prev, ...update } : prev))
+                }
               />
             )}
           </div>
