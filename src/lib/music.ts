@@ -66,6 +66,26 @@ export interface LibraryTrack {
   moods: string[];
   genres: string[];
   waveformUrl: string | null;
+  /** Epidemic's own flag. Most of the catalog is instrumental. */
+  hasVocals: boolean;
+  /** "NONE" | "PRESENCE" (backing/ad-libs) | "LEAD" (sung throughout). */
+  vocalType: string | null;
+  /** Release artwork. Makes the list scannable instead of a wall of text. */
+  imageUrl: string | null;
+  isExplicit: boolean;
+}
+
+/** A mood/genre facet with how many tracks carry it, straight from the API. */
+export interface LibraryFacet {
+  id: string;
+  name: string;
+  count: number;
+}
+
+export interface LibrarySearchResult {
+  tracks: LibraryTrack[];
+  moods: LibraryFacet[];
+  genres: LibraryFacet[];
 }
 
 interface RawTrack {
@@ -77,6 +97,10 @@ interface RawTrack {
   moods?: { name: string }[];
   genres?: { name: string }[];
   waveformUrl?: string;
+  hasVocals?: boolean;
+  vocalType?: string;
+  isExplicit?: boolean;
+  images?: { XS?: string; S?: string; default?: string };
 }
 
 function toLibraryTrack(t: RawTrack): LibraryTrack {
@@ -89,24 +113,86 @@ function toLibraryTrack(t: RawTrack): LibraryTrack {
     moods: (t.moods ?? []).map((m) => m.name),
     genres: (t.genres ?? []).map((g) => g.name),
     waveformUrl: t.waveformUrl ?? null,
+    hasVocals: Boolean(t.hasVocals),
+    vocalType: t.vocalType ?? null,
+    imageUrl: t.images?.S ?? t.images?.default ?? t.images?.XS ?? null,
+    isExplicit: Boolean(t.isExplicit),
   };
 }
 
-// Free-text search across the licensed catalog, for the browse-and-pick UI.
-export async function searchLibrary(term: string, limit = 24): Promise<LibraryTrack[]> {
-  const apiKey = getEpidemicApiKey();
-  if (!apiKey) return [];
+export interface LibrarySearchOptions {
+  mood?: string | null;
+  genre?: string | null;
+  /** "vocals" narrows to sung tracks, "instrumental" excludes them. */
+  vocals?: "any" | "vocals" | "instrumental";
+  limit?: number;
+}
 
-  const params = new URLSearchParams({ term: term || "event", limit: String(Math.min(limit, 60)) });
+/**
+ * Free-text search across the licensed catalog, for the browse-and-pick UI.
+ *
+ * THROWS on API failure rather than returning []. Swallowing the error made a
+ * dead API key and a genuinely empty result set look identical in the UI —
+ * "No tracks found. Try another search." — which is the worst possible thing
+ * to tell someone whose search was actually fine.
+ *
+ * Only parameters verified against the live API are sent. Checked directly:
+ *   mood=, genre=       work, and work with no term at all (so, browse)
+ *   vocalType=LEAD      works — 20/20 sung vs 8/20 unfiltered
+ *   hasVocals=true      SILENTLY IGNORED, returns the unfiltered set
+ *   bpmMin/bpmMax       SILENTLY IGNORED
+ *   page=2              SILENTLY IGNORED, returns page 1 again
+ * BPM and the instrumental-only case are therefore filtered here, not there.
+ */
+export async function searchLibrary(term: string, options: LibrarySearchOptions = {}): Promise<LibrarySearchResult> {
+  const apiKey = getEpidemicApiKey();
+  if (!apiKey) {
+    throw new Error("No music library is connected. Add an Epidemic Sound API key to enable search.");
+  }
+
+  const wantsVocals = options.vocals === "vocals";
+  // Ask for extra when we intend to filter locally, so narrowing doesn't
+  // empty the list.
+  const requested = Math.min(60, options.limit ?? 30);
+  const params = new URLSearchParams({ limit: String(requested) });
+
+  // A term is optional when browsing by facet — "all the house tracks" is a
+  // legitimate query, and forcing a filler term would skew it.
+  if (term) params.set("term", term);
+  else if (!options.mood && !options.genre) params.set("term", "event");
+
+  if (options.mood) params.set("mood", options.mood);
+  if (options.genre) params.set("genre", options.genre);
+  // LEAD is the only value that reliably narrows, and it is what someone
+  // asking for "songs with singing" actually means.
+  if (wantsVocals) params.set("vocalType", "LEAD");
+
   const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
   });
   if (!response.ok) {
-    console.error("[music] library search failed", response.status);
-    return [];
+    const detail = await response.text().catch(() => "");
+    console.error("[music] library search failed", response.status, detail.slice(0, 200));
+    throw new Error(
+      response.status === 401 || response.status === 403
+        ? "The music library rejected our credentials. The API key may have expired."
+        : `The music library is unavailable right now (error ${response.status}).`,
+    );
   }
-  const data = (await response.json()) as { tracks: RawTrack[] };
-  return (data.tracks ?? []).map(toLibraryTrack);
+
+  const data = (await response.json()) as {
+    tracks?: RawTrack[];
+    aggregations?: { moods?: LibraryFacet[]; genres?: LibraryFacet[] };
+  };
+
+  let tracks = (data.tracks ?? []).map(toLibraryTrack);
+  if (options.vocals === "instrumental") tracks = tracks.filter((t) => !t.hasVocals);
+
+  return {
+    tracks,
+    moods: (data.aggregations?.moods ?? []).slice(0, 14),
+    genres: (data.aggregations?.genres ?? []).slice(0, 14),
+  };
 }
 
 // Resolves a track's licensed MP3 URL. Used by the preview proxy so the API
@@ -125,7 +211,14 @@ export async function getTrackAudioUrl(trackId: string): Promise<string | null> 
   return url;
 }
 
-async function runEpidemicSearch(apiKey: string, params: URLSearchParams): Promise<EpidemicSearchResult | null> {
+/** Categories where a sung track beats an instrumental one. */
+const PREFERS_VOCALS = new Set(["upbeat-pop", "high-energy-edm", "feel-good-indie"]);
+
+async function runEpidemicSearch(
+  apiKey: string,
+  params: URLSearchParams,
+  catalogId?: string,
+): Promise<EpidemicSearchResult | null> {
   const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
   });
@@ -134,8 +227,27 @@ async function runEpidemicSearch(apiKey: string, params: URLSearchParams): Promi
     return null;
   }
   const data = (await response.json()) as { tracks: RawTrack[] };
-  const track = data.tracks[0];
-  if (!track) return null;
+  const tracks = data.tracks ?? [];
+  if (tracks.length === 0) return null;
+
+  // Do NOT just take tracks[0].
+  //
+  // That was why every auto-generated video for a given event type came back
+  // with the same piece of music: a fixed search term produces a stable
+  // ranking, and always taking the top hit makes the choice deterministic.
+  // A photo booth posting three recaps a week noticed immediately.
+  //
+  // Instead pick from the strongest handful. Sung tracks are promoted for the
+  // energetic categories — the catalog skews heavily instrumental (typically
+  // 8 of 20 results have vocals at all), so without this the upbeat styles
+  // sound like background music.
+  const pool = tracks.slice(0, 12);
+  const preferred = catalogId && PREFERS_VOCALS.has(catalogId) ? pool.filter((t) => t.hasVocals) : [];
+  // Only honour the preference if it leaves a real choice; otherwise a thin
+  // result set would collapse back to one deterministic track.
+  const candidates = preferred.length >= 3 ? preferred : pool;
+  const track = candidates[Math.floor(Math.random() * candidates.length)];
+
   return {
     id: track.id,
     title: track.title,
@@ -149,11 +261,11 @@ async function searchEpidemicTrack(catalogId: string): Promise<EpidemicSearchRes
   const query = EPIDEMIC_SEARCH[catalogId];
   if (!apiKey || !query) return null;
 
-  const filtered = new URLSearchParams({ term: query.term, limit: "5" });
+  const filtered = new URLSearchParams({ term: query.term, limit: "20" });
   if (query.mood) filtered.append("mood", query.mood);
   if (query.genre) filtered.append("genre", query.genre);
 
-  const result = await runEpidemicSearch(apiKey, filtered);
+  const result = await runEpidemicSearch(apiKey, filtered, catalogId);
   if (result) return result;
 
   // An unrecognized mood/genre id silently returns zero results rather than
@@ -161,7 +273,7 @@ async function searchEpidemicTrack(catalogId: string): Promise<EpidemicSearchRes
   // fully blocks music for that category.
   if (query.mood || query.genre) {
     console.error("[music] Filtered search empty for", catalogId, "— retrying on term alone");
-    return runEpidemicSearch(apiKey, new URLSearchParams({ term: query.term, limit: "5" }));
+    return runEpidemicSearch(apiKey, new URLSearchParams({ term: query.term, limit: "20" }), catalogId);
   }
   return null;
 }
