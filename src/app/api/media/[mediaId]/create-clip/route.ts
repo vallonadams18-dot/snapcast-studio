@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { getVideoDurationSeconds, detectHighlightWindow, createVerticalClip } from "@/lib/video";
+import { getVideoDurationSeconds, detectHighlightWindow, createVerticalClip, finalizeForDelivery } from "@/lib/video";
 import { analyzeClip, PLATFORMS } from "@/lib/ai";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { mixTrackIntoClip } from "@/lib/music";
@@ -121,6 +121,9 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
       );
       if (marked) clipBuffer = marked;
     }
+
+    // Guarantee delivery encoding regardless of which optional stages ran.
+    clipBuffer = await finalizeForDelivery(clipBuffer);
 
     const key = randomFileKey(media.eventId, `clip-${media.id}.mp4`);
     const saved = await getStorageAdapter().save(key, clipBuffer, "video/mp4");

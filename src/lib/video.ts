@@ -188,6 +188,63 @@ export async function detectHighlightWindow(
   }
 }
 
+/**
+ * Guarantees the bytes handed to storage are actually deliverable.
+ *
+ * Delivery settings (+faststart in particular) were only ever applied by
+ * OPTIONAL stages — the music mix and the watermark. When a montage skipped
+ * all of them, which happens whenever the client has no logo and the music
+ * provider is unavailable, the file shipped as the raw CRF-18 intermediate
+ * with its moov atom at the end. A browser then has to fetch the whole file
+ * before it can play or scrub, which is the wrong shape for a phone.
+ *
+ * Prefers a STREAM COPY. Relocating the moov atom needs no re-encode, so
+ * this costs milliseconds and loses nothing — re-encoding a finished video
+ * purely to move four bytes of index would throw away a generation of
+ * quality for no reason. A full delivery encode is the fallback, used only
+ * when the copy fails or the frame rate is somehow wrong.
+ *
+ * Returns the input untouched on any failure: a video without faststart is
+ * still a video, and losing it here would be far worse.
+ */
+export async function finalizeForDelivery(videoBuffer: Buffer): Promise<Buffer<ArrayBuffer>> {
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-final-"));
+  try {
+    const inputPath = path.join(tmpDir, "in.mp4");
+    const outputPath = path.join(tmpDir, "out.mp4");
+    await writeFile(inputPath, videoBuffer);
+
+    const fps = await getVideoFrameRate(inputPath).catch(() => null);
+    const rateIsRight = fps !== null && Math.abs(fps - VIDEO_FPS) < 0.5;
+
+    if (rateIsRight) {
+      try {
+        await runFfmpeg(["-i", inputPath, "-c", "copy", "-movflags", "+faststart", "-y", outputPath]);
+        return await readFile(outputPath);
+      } catch {
+        // Fall through to a real encode.
+      }
+    }
+
+    await runFfmpeg([
+      "-i", inputPath,
+      "-r", String(VIDEO_FPS),
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      ...deliveryEncode(),
+      // Copy audio when present, and don't fail when it isn't.
+      "-c:a", "copy",
+      "-y", outputPath,
+    ]);
+    return await readFile(outputPath);
+  } catch (err) {
+    console.error("[video] delivery finalize failed, shipping the video as-is", err);
+    return Buffer.from(videoBuffer) as Buffer<ArrayBuffer>;
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
 export interface CreateClipOptions {
   sourcePath: string;
   startSeconds: number;

@@ -6,7 +6,12 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { createPhotoMontage, getVideoDurationSeconds, getVideoFrameRate } from "@/lib/video";
+import {
+  createPhotoMontage,
+  getVideoDurationSeconds,
+  getVideoFrameRate,
+  finalizeForDelivery,
+} from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
@@ -211,6 +216,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     const representativeFrame = await getMediaBytes(selected[0]);
     const analysis = await analyzeClip(selected[0], event, account, representativeFrame);
     await logUsageEvent(account.id, "montage");
+
+    // Delivery encoding was only ever applied by OPTIONAL stages — the music
+    // mix and the watermark. With no logo and the music provider returning
+    // 402, every one of them skips and the file shipped as a raw intermediate
+    // with no +faststart. This guarantees it regardless of the path taken.
+    montageBuffer = await finalizeForDelivery(montageBuffer);
 
     const key = randomFileKey(eventId, `montage-${Date.now()}.mp4`);
     const saved = await getStorageAdapter().save(key, montageBuffer, "video/mp4");
