@@ -94,7 +94,6 @@ class S3CompatibleAdapter implements StorageAdapter {
 
   async saveFromFile(key: string, filePath: string, contentType: string, contentLength: number): Promise<SavedFile> {
     const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
-    const { createReadStream } = await import("node:fs");
 
     const bucket = process.env.STORAGE_S3_BUCKET;
     const publicBaseUrl = process.env.STORAGE_S3_PUBLIC_URL;
@@ -111,21 +110,39 @@ class S3CompatibleAdapter implements StorageAdapter {
       },
     });
 
-    // Streamed body with an explicit length — S3 requires ContentLength for
-    // unseekable streams, and we know it exactly from the counted download.
-    await client.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: createReadStream(filePath),
-        ContentType: contentType,
-        ContentLength: contentLength,
-      }),
-    );
+    await client.send(new PutObjectCommand(await buildS3PutInput(bucket, key, filePath, contentType, contentLength)));
 
     const url = `${publicBaseUrl.replace(/\/$/, "")}/${key}`;
     return { url, storageRef: url };
   }
+}
+
+/**
+ * The exact PutObject input for a streamed-from-disk save. Extracted so
+ * tests can verify the streaming contract — a ReadStream body (never a
+ * Buffer), the counted ContentLength, and the DETECTED ContentType —
+ * without mocking the AWS SDK itself.
+ *
+ * Honest limitation: because the body is an unseekable stream, the SDK
+ * cannot transparently retry a failed upload by rewinding — a mid-upload
+ * network failure surfaces as an error to the webhook rather than being
+ * silently retried. Acceptable until WH-4 adds durable retries.
+ */
+export async function buildS3PutInput(
+  bucket: string,
+  key: string,
+  filePath: string,
+  contentType: string,
+  contentLength: number,
+) {
+  const { createReadStream } = await import("node:fs");
+  return {
+    Bucket: bucket,
+    Key: key,
+    Body: createReadStream(filePath),
+    ContentType: contentType,
+    ContentLength: contentLength,
+  };
 }
 
 let adapter: StorageAdapter | undefined;

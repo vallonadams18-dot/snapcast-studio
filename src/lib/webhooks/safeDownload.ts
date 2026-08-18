@@ -301,6 +301,13 @@ export type Transport = (target: {
   /** Overridable so real-socket fixtures can run in test time, not wall time. */
   connectTimeoutMs?: number;
   headersTimeoutMs?: number;
+  /**
+   * TEST-ONLY: a fixture CA for the local TLS server. Providing a ca
+   * REPLACES the trust store — certificate and hostname verification still
+   * run in full, which is exactly what the TLS fixture proves. Production
+   * callers never set this.
+   */
+  ca?: string;
 }) => Promise<TransportResponse>;
 
 /**
@@ -311,7 +318,7 @@ export type Transport = (target: {
  * address is checked against the pin, so even a hijacked lookup path can't
  * silently land elsewhere.
  */
-export const realTransport: Transport = ({ url, address, connectTimeoutMs = CONNECT_TIMEOUT_MS, headersTimeoutMs = HEADERS_TIMEOUT_MS }) =>
+export const realTransport: Transport = ({ url, address, connectTimeoutMs = CONNECT_TIMEOUT_MS, headersTimeoutMs = HEADERS_TIMEOUT_MS, ca }) =>
   new Promise<TransportResponse>((resolve, reject) => {
     const isHttps = url.protocol === "https:";
     const requestFn = isHttps ? httpsRequest : httpRequest;
@@ -325,6 +332,7 @@ export const realTransport: Transport = ({ url, address, connectTimeoutMs = CONN
         method: "GET",
         // No cookies, no auth, no forwarded headers — ever.
         headers: { Accept: "image/*,video/*", "User-Agent": "Snapcast-Webhook/1.0" },
+        ...(ca ? { ca } : {}),
         // Node's agent calls lookup in TWO forms, and on Node 22 the default
         // is `{ all: true }`, which expects an ARRAY of address objects.
         // Answering with the single-address form there yields
@@ -607,8 +615,10 @@ async function streamToTempFile(
       try {
         step = await withTimeout(iterator.next(), limits.idleMs, "download stalled;");
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "read failed";
-        return await fail(msg.includes("timed out") ? "timeout" : "connect", msg);
+        // Static text only: stream errors can embed local paths or peer
+        // addresses, which belong in neither logs nor responses.
+        const timedOut = err instanceof Error && err.message.includes("timed out");
+        return await fail(timedOut ? "timeout" : "connect", timedOut ? "download stalled" : "download connection failed");
       }
       if (step.done) break;
       const chunk = step.value;
@@ -683,6 +693,6 @@ async function streamToTempFile(
       redirects,
     };
   } catch (err) {
-    return await fail("storage", err instanceof Error ? err.message : "failed to store the download");
+    return await fail("storage", "failed to store the download");
   }
 }

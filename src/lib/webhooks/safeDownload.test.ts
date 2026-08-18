@@ -544,3 +544,206 @@ test("concurrency: beyond active+queue capacity, downloads are refused as busy",
   assert.equal(busy.length, 1);
   for (const r of settled) if (r.ok) await rm(r.tmpDir, { recursive: true, force: true });
 });
+
+// ==================================================================
+// Correction pass — TLS reality, listener hygiene, storage faults
+// ==================================================================
+import { createServer as createHttpsServer } from "node:https";
+import { readFileSync } from "node:fs";
+import { writeFile as writeFileFs, mkdir as mkdirFs } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { buildS3PutInput } from "../storage.ts";
+
+// Self-signed pair, SAN = DNS:webhook-fixture.test only. Grants no trust
+// anywhere: the test passes it as an explicit `ca`, which replaces the trust
+// store for that single connection while verification still runs in full.
+const FIX_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__");
+const FIXTURE_KEY = readFileSync(path.join(FIX_DIR, "fixture-key.pem"), "utf8");
+const FIXTURE_CERT = readFileSync(path.join(FIX_DIR, "fixture-cert.pem"), "utf8");
+
+test("REAL TLS: SNI, Host, cert hostname verification and pinning all hold", async () => {
+  let seenSni: string | undefined;
+  let seenHost: string | undefined;
+  const server = createHttpsServer(
+    {
+      key: FIXTURE_KEY,
+      cert: FIXTURE_CERT,
+      SNICallback: (servername, cb) => {
+        seenSni = servername;
+        cb(null, undefined);
+      },
+    },
+    (req, res) => {
+      seenHost = req.headers.host;
+      res.writeHead(200);
+      res.end(Buffer.from(PNG));
+    },
+  );
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  try {
+    // The hostname exists only here — the pinned lookup, not DNS, carries the
+    // connection to 127.0.0.1, while the hostname must still flow into SNI,
+    // the Host header, and certificate verification.
+    const response = await realTransport({
+      url: new URL(`https://webhook-fixture.test:${port}/a.png`),
+      address: { address: "127.0.0.1", family: 4 },
+      ca: FIXTURE_CERT,
+    });
+    assert.equal(response.statusCode, 200);
+    const chunks: Uint8Array[] = [];
+    for await (const c of response.body) chunks.push(c);
+    assert.equal(Buffer.concat(chunks).length, PNG.byteLength);
+    assert.equal(seenSni, "webhook-fixture.test");
+    assert.equal(seenHost, `webhook-fixture.test:${port}`);
+
+    // Same server, same CA, WRONG hostname: cert hostname verification must
+    // fail — proving it genuinely runs and is not bypassed by the pin.
+    await assert.rejects(
+      realTransport({
+        url: new URL(`https://wrong-name.test:${port}/a.png`),
+        address: { address: "127.0.0.1", family: 4 },
+        ca: FIXTURE_CERT,
+      }),
+      (err: Error & { code?: string }) => err.code === "ERR_TLS_CERT_ALTNAME_INVALID" || /altname/i.test(err.message),
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("REAL SOCKET: connect timeout fires against an unroutable address", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    realTransport({
+      url: new URL("https://unreachable.example.com/x"),
+      // RFC1918 blackhole — SYN goes unanswered. realTransport does no
+      // policy of its own; policy runs upstream of it.
+      address: { address: "10.255.255.1", family: 4 },
+      connectTimeoutMs: 400,
+    }),
+    /timed out/,
+  );
+  assert.ok(Date.now() - started < 3000, "must fail via the connect timer, not TCP defaults");
+});
+
+test("REAL SOCKET: short body stall survives; stall beyond the idle limit fails", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200);
+    res.flushHeaders();
+    if (req.url === "/short-stall") setTimeout(() => res.end(Buffer.from(JPEG)), 300);
+    // "/forever": headers only — the body never comes.
+  });
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  const consume = async (urlPath: string, idleMs: number) => {
+    const response = await realTransport({
+      url: new URL(`http://localhost:${port}${urlPath}`),
+      address: { address: "127.0.0.1", family: 4 },
+    });
+    const it = response.body[Symbol.asyncIterator]();
+    const chunks: Uint8Array[] = [];
+    try {
+      for (;;) {
+        const step = await Promise.race([
+          it.next(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("idle timed out")), idleMs)),
+        ]);
+        if (step.done) break;
+        chunks.push(step.value);
+      }
+    } finally {
+      response.destroy();
+    }
+    return Buffer.concat(chunks);
+  };
+  try {
+    const short = await consume("/short-stall", 1500);
+    assert.equal(short.length, JPEG.byteLength); // 300ms stall < idle: survives
+    await assert.rejects(consume("/forever", 400), /idle timed out/); // real stall dies
+  } finally {
+    server.close();
+  }
+});
+
+test("backpressure: a large chunked download raises no MaxListenersExceededWarning", async () => {
+  const warnings: string[] = [];
+  const onWarning = (w: Error) => warnings.push(w.name);
+  process.on("warning", onWarning);
+  try {
+    // 300 chunks of 64 KiB — hundreds of write/backpressure cycles.
+    const chunk = new Uint8Array(64 * 1024).fill(3);
+    const parts: Uint8Array[] = [MP4, ...Array.from({ length: 300 }, () => chunk)];
+    const t: Transport = async () => respond(200, {}, ...parts);
+    const r = await downloadWebhookMedia("https://big.example.com/x", { resolver: pub, transport: t });
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.bytes, MP4.byteLength + 300 * chunk.byteLength);
+      await rm(r.tmpDir, { recursive: true, force: true });
+    }
+    // Give any queued warning a tick to surface before asserting.
+    await new Promise((res) => setTimeout(res, 20));
+    assert.equal(warnings.filter((w) => w === "MaxListenersExceededWarning").length, 0);
+  } finally {
+    process.off("warning", onWarning);
+  }
+});
+
+test("random bytes containing the word webm are rejected", () => {
+  const sneaky = pad([0x00, 0x11, 0x22, ...enc.encode("look a webm string")]);
+  assert.equal(detectMediaType(sneaky), null);
+  // Even EBML magic + the word, WITHOUT a DocType element, is rejected.
+  const sneakyEbml = pad([0x1a, 0x45, 0xdf, 0xa3, ...enc.encode("____webm____")]);
+  assert.equal(detectMediaType(sneakyEbml), null);
+});
+
+test("HEIF family brands and malformed ftyp are rejected", () => {
+  const ftyp = (brand: string) => pad([0, 0, 0, 24, ...enc.encode("ftyp"), ...enc.encode(brand)]);
+  assert.equal(detectMediaType(ftyp("msf1")), null);
+  assert.equal(detectMediaType(ftyp("hevc")), null);
+  assert.equal(detectMediaType(ftyp("qqqq")), null);
+});
+
+test("local staging: copy failure and rename failure both leave no .tmp debris", async () => {
+  const prevCwd = process.cwd();
+  const sandbox = await mkdtemp(path.join(tmpdir(), "snapcast-stagefault-"));
+  try {
+    process.chdir(sandbox);
+    const { getStorageAdapter } = await import("../storage.ts");
+    const adapter = getStorageAdapter();
+
+    // Copy failure: source file does not exist.
+    await assert.rejects(adapter.saveFromFile("evt/copyfail.jpg", path.join(sandbox, "missing.bin"), "image/jpeg", 1));
+
+    // Rename failure: the destination already exists as a DIRECTORY.
+    const src = path.join(sandbox, "real.bin");
+    await writeFileFs(src, Buffer.from("bytes"));
+    await mkdirFs(path.join(sandbox, "public", "uploads", "evt", "renamefail.jpg"), { recursive: true });
+    await assert.rejects(adapter.saveFromFile("evt/renamefail.jpg", src, "image/jpeg", 5));
+
+    const leftovers = (await readdir(path.join(sandbox, "public", "uploads", "evt"))).filter((f) =>
+      f.includes(".tmp-"),
+    );
+    assert.equal(leftovers.length, 0);
+  } finally {
+    process.chdir(prevCwd);
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("S3 streamed input: ReadStream body, counted ContentLength, detected ContentType", async () => {
+  const sandbox = await mkdtemp(path.join(tmpdir(), "snapcast-s3input-"));
+  try {
+    const src = path.join(sandbox, "media.mp4");
+    await writeFileFs(src, Buffer.alloc(1234, 7));
+    const input = await buildS3PutInput("bucket", "evt/webhook.mp4", src, "video/mp4", 1234);
+    const { ReadStream } = await import("node:fs");
+    assert.ok(input.Body instanceof ReadStream, "body must stream from disk, never a Buffer");
+    assert.equal(String((input.Body as InstanceType<typeof ReadStream>).path), src);
+    assert.equal(input.ContentLength, 1234);
+    assert.equal(input.ContentType, "video/mp4");
+    (input.Body as InstanceType<typeof ReadStream>).destroy();
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
