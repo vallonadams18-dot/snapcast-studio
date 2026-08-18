@@ -15,6 +15,7 @@ import { rateLimit } from "@/lib/rateLimit";
 import { logUsageEvent } from "@/lib/usage";
 import { isFeatureEnabled } from "@/lib/featureFlags";
 import { addBrandBookends, applyWatermark } from "@/lib/branding";
+import { selectPhotosForMontage } from "@/lib/photoSelection";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
@@ -52,25 +53,54 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     return NextResponse.json({ error: `Need at least ${MIN_PHOTOS} photos to compile a video.` }, { status: 400 });
   }
 
-  // Best-scored photos first (highest combined energy/quality/rarity);
-  // unscored photos (no API key connected) fall back to most recent.
-  const scored = [...candidates].sort((a, b) => {
-    const scoreA = (a.energyScore ?? 0) + (a.visualQualityScore ?? 0) + (a.momentRarityScore ?? 0);
-    const scoreB = (b.energyScore ?? 0) + (b.visualQualityScore ?? 0) + (b.momentRarityScore ?? 0);
-    return scoreB - scoreA;
-  });
-  const selected = scored.slice(0, MAX_PHOTOS);
-
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-montage-req-"));
   try {
-    const photoPaths: string[] = [];
-    for (const [i, photo] of selected.entries()) {
+    // Local path for a photo, downloading first when storage is remote.
+    // Cached: selection hashes each photo and the renderer then reads the
+    // chosen ones, and a remote file should only ever be fetched once.
+    const pathCache = new Map<string, string>();
+    const resolvePath = async (photo: (typeof candidates)[number]): Promise<string | null> => {
+      const cached = pathCache.get(photo.id);
+      if (cached) return cached;
       let photoPath = photo.storagePath;
-      if (photo.storagePath.startsWith("http")) {
-        photoPath = path.join(tmpDir, `photo-${i}.jpg`);
-        await writeFile(photoPath, await getMediaBytes(photo));
+      if (photoPath.startsWith("http")) {
+        photoPath = path.join(tmpDir, `photo-${photo.id}.jpg`);
+        try {
+          await writeFile(photoPath, await getMediaBytes(photo));
+        } catch {
+          return null;
+        }
       }
-      photoPaths.push(photoPath);
+      pathCache.set(photo.id, photoPath);
+      return photoPath;
+    };
+
+    // Choose and sequence the photos.
+    //
+    // Replaces "sort by total score, take the top eight". That picked five
+    // near-identical frames from a single booth session — they all score
+    // alike, because scoring never compared one photo to another — and it
+    // ordered them best-to-worst, so the weakest image was always the one
+    // left on screen at the end, which is what a looping video rests on.
+    const selection = await selectPhotosForMontage(candidates, MAX_PHOTOS, resolvePath);
+    const selected = selection.selected.map((s) => s.candidate);
+
+    if (selected.length < MIN_PHOTOS) {
+      return NextResponse.json(
+        { error: `Need at least ${MIN_PHOTOS} distinct photos to compile a video.` },
+        { status: 400 },
+      );
+    }
+
+    console.log(
+      `[montage] ${selected.length} photos, ${selection.duplicatesFound} near-duplicates skipped — ` +
+        selection.selected.map((s) => `${s.role}:${s.candidate.id.slice(-6)}`).join(" → "),
+    );
+
+    const photoPaths: string[] = [];
+    for (const item of selection.selected) {
+      const resolved = await resolvePath(item.candidate);
+      if (resolved) photoPaths.push(resolved);
     }
 
     const montagePath = path.join(tmpDir, "montage.mp4");
@@ -117,8 +147,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       if (marked) montageBuffer = marked;
     }
 
-    // First (best-scored) photo doubles as the representative frame for
-    // caption/score generation — no separate frame extraction needed.
+    // The opening shot doubles as the representative frame for caption and
+    // score generation — no separate frame extraction needed. It is also the
+    // right choice: the opener is the highest-energy photo, so the caption is
+    // written about the moment the video actually leads with.
     const representativeFrame = await getMediaBytes(selected[0]);
     const analysis = await analyzeClip(selected[0], event, account, representativeFrame);
     await logUsageEvent(account.id, "montage");
@@ -153,7 +185,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       ),
     });
 
-    return NextResponse.json({ montage, photoCount: selected.length, style: style.name });
+    return NextResponse.json({
+      montage,
+      photoCount: selected.length,
+      style: style.name,
+      duplicatesSkipped: selection.duplicatesFound,
+    });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Couldn't compile a video from your photos. Try again in a moment." },

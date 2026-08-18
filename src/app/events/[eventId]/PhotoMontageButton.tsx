@@ -37,8 +37,14 @@ export function PhotoMontageButton({
       if (!response.ok) throw new Error(body.error ?? "Couldn't create the video.");
 
       setStatus("idle");
+      // Say when duplicates were skipped. Otherwise "8 photos" from a 20-photo
+      // event reads as the app ignoring most of the upload, when in fact it
+      // dropped repeats of the same moment on purpose.
+      const skipped = typeof body.duplicatesSkipped === "number" ? body.duplicatesSkipped : 0;
       setSuccess(
-        `Video ready — ${body.photoCount} photos in the ${body.style ?? "chosen"} style. It's in your media below.`,
+        `Video ready — ${body.photoCount} photos in the ${body.style ?? "chosen"} style` +
+          (skipped > 0 ? `, skipping ${skipped} near-duplicate${skipped === 1 ? "" : "s"}` : "") +
+          `. It's in your media below.`,
       );
       router.refresh();
     } catch (err) {
