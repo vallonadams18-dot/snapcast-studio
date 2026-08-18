@@ -431,6 +431,14 @@ async function streamToTempFile(
   const dir = await mkdtemp(path.join(tmpdir(), "snapcast-webhook-"));
   const filePath = path.join(dir, "media.bin");
   const file = createWriteStream(filePath, { mode: 0o600 });
+  // A write stream with no error listener turns ANY late write failure —
+  // a deadline destroying it with a write in flight, disk filling mid-stream
+  // — into an uncaught exception that takes the whole process down. Caught
+  // here and surfaced through the normal failure path instead.
+  let fileError: Error | null = null;
+  file.on("error", (err) => {
+    fileError = err;
+  });
   const hash = createHash("sha256");
 
   let total = 0;
@@ -490,8 +498,18 @@ async function streamToTempFile(
       if (total > cap) return await fail("too_large", "media exceeds the size limit");
 
       hash.update(chunk);
+      if (fileError) return await fail("storage", "temp file write failed");
       const canWriteMore = file.write(Buffer.from(chunk));
-      if (!canWriteMore) await new Promise<void>((res) => file.once("drain", res));
+      if (!canWriteMore) {
+        await new Promise<void>((res) => {
+          const done = () => res();
+          file.once("drain", done);
+          // A stream that errors mid-backpressure never emits drain.
+          file.once("error", done);
+          file.once("close", done);
+        });
+      }
+      if (fileError) return await fail("storage", "temp file write failed");
     }
 
     // Streams shorter than the sniff window still get one classification try.

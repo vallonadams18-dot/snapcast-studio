@@ -57,7 +57,6 @@ function respond(
   return { statusCode, headers, body: bodyOf(...body), destroy() {} };
 }
 
-const publicResolver: Resolver = async () => [{ address: "203.0.113.9" as never, family: 4 }];
 // 203.0.113.x is TEST-NET and would be blocked — use a real public range.
 const pub: Resolver = async () => [{ address: "93.184.216.34", family: 4 }];
 
