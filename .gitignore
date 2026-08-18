@@ -53,3 +53,9 @@ next-env.d.ts
 
 # user uploads
 /public/uploads
+
+# TEST-ONLY TLS fixture (SAN webhook-fixture.test) — self-signed, trust-inert,
+# required for the real-transport test suite to run from a fresh checkout.
+# Never referenced by production configuration.
+!src/lib/webhooks/__fixtures__/fixture-cert.pem
+!src/lib/webhooks/__fixtures__/fixture-key.pem

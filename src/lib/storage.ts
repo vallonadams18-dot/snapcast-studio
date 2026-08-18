@@ -28,11 +28,24 @@ export interface StorageAdapter {
 // the `location /uploads/` block in deploy/nginx-snapcast.conf. If you
 // deploy somewhere without that nginx config, uploads will not load.
 class LocalDiskAdapter implements StorageAdapter {
+  // Containment lives in the ADAPTER, not just in well-behaved callers: a
+  // key like "../../.env" must fail here even if some future call site
+  // forgets to sanitise. Resolved-path prefix check, not string games.
+  private async containedPath(key: string): Promise<string> {
+    const path = await import("node:path");
+    const root = path.resolve(process.cwd(), "public", "uploads");
+    const resolved = path.resolve(root, key);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new Error("storage key resolves outside the uploads directory");
+    }
+    return resolved;
+  }
+
   async save(key: string, buffer: Buffer): Promise<SavedFile> {
     const { mkdir, writeFile } = await import("node:fs/promises");
     const path = await import("node:path");
 
-    const diskPath = path.join(process.cwd(), "public", "uploads", key);
+    const diskPath = await this.containedPath(key);
     await mkdir(path.dirname(diskPath), { recursive: true });
     await writeFile(diskPath, buffer);
     return { url: `/uploads/${key}`, storageRef: diskPath };
@@ -42,7 +55,7 @@ class LocalDiskAdapter implements StorageAdapter {
     const { mkdir, copyFile, rename, rm } = await import("node:fs/promises");
     const path = await import("node:path");
 
-    const diskPath = path.join(process.cwd(), "public", "uploads", key);
+    const diskPath = await this.containedPath(key);
     await mkdir(path.dirname(diskPath), { recursive: true });
     // Copy into the FINAL directory first, then rename into place: rename
     // within one directory is atomic, so nginx can never serve a

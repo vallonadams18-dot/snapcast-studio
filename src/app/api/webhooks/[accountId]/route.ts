@@ -149,6 +149,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ acc
     });
 
     return NextResponse.json({ ok: true, mediaId: media.id }, { status: 202 });
+  } catch (err) {
+    // Static message + safe code only: raw storage/DB errors can carry
+    // filesystem paths or provider details that belong in neither the
+    // response nor the logs.
+    const kind = err instanceof Error ? err.constructor.name : "unknown";
+    console.error("[webhook] processing failed account=" + accountId + " error=" + kind);
+    return NextResponse.json({ error: "failed to process webhook media" }, { status: 500 });
   } finally {
     // The downloader's temp dir is the caller's to clean, on every path out
     // of this block — success, hint mismatch, storage failure, or analysis

@@ -36,7 +36,7 @@ const GIF = pad([...enc.encode("GIF89a")]);
 const WEBP = pad([...enc.encode("RIFF"), 0, 0, 0, 0, ...enc.encode("WEBP")]);
 const MP4 = pad([0, 0, 0, 24, ...enc.encode("ftypisom")]);
 const MOV = pad([0, 0, 0, 24, ...enc.encode("ftypqt  ")]);
-const WEBM = pad([0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x84, ...enc.encode("webm")]); // real DocType element
+const WEBM = pad([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, ...enc.encode("webm")]); // structurally valid EBML header
 
 function bodyOf(...parts: (Uint8Array | "STALL")[]): AsyncIterable<Uint8Array> {
   return {
@@ -744,6 +744,209 @@ test("S3 streamed input: ReadStream body, counted ContentLength, detected Conten
     assert.equal(input.ContentType, "video/mp4");
     (input.Body as InstanceType<typeof ReadStream>).destroy();
   } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
+
+// ==================================================================
+// Final correction pass — Codex re-audit regressions
+// ==================================================================
+import { detectWebm, downloadQueueDepth } from "./safeDownload.ts";
+
+test("POOLING BYPASS: same host:port, new pin — request 2 reaches ONLY the new server", async () => {
+  // Two servers on the SAME port, different loopback addresses, so a
+  // keep-alive agent keyed on host:port would happily reuse server A's
+  // socket for a request pinned to B — which is exactly the reproduced
+  // bypass: the signed path reached the OLD server before validation.
+  const seenA: string[] = [];
+  const seenB: string[] = [];
+  const serverA = createServer((req, res) => {
+    seenA.push(req.url ?? "");
+    res.writeHead(200);
+    res.end(Buffer.from(JPEG));
+  });
+  await new Promise<void>((res) => serverA.listen(0, "127.0.0.1", res));
+  const port = (serverA.address() as { port: number }).port;
+  const serverB = createServer((req, res) => {
+    seenB.push(req.url ?? "");
+    res.writeHead(200);
+    res.end(Buffer.from(JPEG));
+  });
+  await new Promise<void>((res, rej) => {
+    serverB.once("error", rej);
+    serverB.listen(port, "127.0.0.2", res);
+  });
+  try {
+    const url = new URL(`http://pool-fixture.test:${port}/first?sig=ONE`);
+    const r1 = await realTransport({ url, address: { address: "127.0.0.1", family: 4 } });
+    for await (const _ of r1.body) void _;
+    const url2 = new URL(`http://pool-fixture.test:${port}/second?sig=TWO`);
+    const r2 = await realTransport({ url: url2, address: { address: "127.0.0.2", family: 4 } });
+    for await (const _ of r2.body) void _;
+
+    assert.deepEqual(seenA, ["/first?sig=ONE"]); // A never saw request 2
+    assert.deepEqual(seenB, ["/second?sig=TWO"]); // B, and only B, got it
+  } finally {
+    serverA.close();
+    serverB.close();
+  }
+});
+
+test("ABSOLUTE DEADLINE: a tiny total budget beats a huge idle timeout", async () => {
+  let destroyed = false;
+  const stalling: Transport = async () => ({
+    statusCode: 200,
+    headers: {},
+    body: bodyOf(MP4, "STALL"),
+    destroy: () => {
+      destroyed = true;
+    },
+  });
+  const started = Date.now();
+  const r = await downloadWebhookMedia("https://stall.example.com/x", {
+    resolver: pub,
+    transport: stalling,
+    totalTimeoutMs: 150,
+    idleTimeoutMs: 60_000, // must NOT carry the wait past the total budget
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "timeout");
+  assert.ok(Date.now() - started < 5_000, "total deadline must cut the oversized idle wait");
+  assert.equal(destroyed, true, "timed-out transport must be destroyed, not abandoned");
+});
+
+test("TIMER SEPARATION: headers slower than the connect timeout still succeed", async () => {
+  const server = createServer((req, res) => {
+    // Connection accepted instantly; headers deliberately later than the
+    // connect timeout but inside the header timeout.
+    setTimeout(() => {
+      res.writeHead(200);
+      res.end(Buffer.from(JPEG));
+    }, 500);
+  });
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const response = await realTransport({
+      url: new URL(`http://localhost:${port}/slow-headers`),
+      address: { address: "127.0.0.1", family: 4 },
+      connectTimeoutMs: 150, // would kill it if still armed post-connect
+      headersTimeoutMs: 3_000,
+    });
+    assert.equal(response.statusCode, 200);
+    for await (const _ of response.body) void _;
+  } finally {
+    server.close();
+  }
+});
+
+test("TIMER SEPARATION: a genuine header timeout still fires", async () => {
+  const server = createServer(() => {
+    // Accept, then never send headers.
+  });
+  await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+  const port = (server.address() as { port: number }).port;
+  try {
+    await assert.rejects(
+      realTransport({
+        url: new URL(`http://localhost:${port}/never`),
+        address: { address: "127.0.0.1", family: 4 },
+        connectTimeoutMs: 2_000,
+        headersTimeoutMs: 250,
+      }),
+      /headers timed out/,
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("ABORTABLE QUEUE: a queued waiter whose deadline expires cannot be resurrected", async () => {
+  let releaseGate: () => void = () => {};
+  const gate = new Promise<void>((res) => (releaseGate = res));
+  const gated: Transport = async () => {
+    await gate;
+    return respond(200, {}, JPEG);
+  };
+  // Fill both active slots with long-budget downloads.
+  const active = Array.from({ length: MAX_CONCURRENT_DOWNLOADS }, () =>
+    downloadWebhookMedia("https://gated.example.com/x", { resolver: pub, transport: gated }),
+  );
+  await new Promise((res) => setTimeout(res, 30)); // let them occupy the slots
+
+  // Queue one more with a deadline far shorter than the gate.
+  const doomed = await downloadWebhookMedia("https://gated.example.com/doomed", {
+    resolver: pub,
+    transport: gated,
+    totalTimeoutMs: 100,
+  });
+  assert.equal(doomed.ok, false);
+  if (!doomed.ok) assert.equal(doomed.code, "timeout"); // timed out IN the queue
+  assert.equal(downloadQueueDepth(), 0, "aborted waiter must leave the queue atomically");
+
+  // Releasing the actives must not resurrect the doomed waiter.
+  releaseGate();
+  const settled = await Promise.all(active);
+  for (const r of settled) {
+    assert.equal(r.ok, true);
+    if (r.ok) await rm(r.tmpDir, { recursive: true, force: true });
+  }
+  assert.equal(downloadQueueDepth(), 0);
+});
+
+test("STRICT FTYP: malformed boxes and invented brands are rejected; exact brands hold", () => {
+  const ftypWithSize = (size: number, brand: string) =>
+    pad([(size >> 24) & 0xff, (size >> 16) & 0xff, (size >> 8) & 0xff, size & 0xff, ...enc.encode("ftyp"), ...enc.encode(brand)]);
+  assert.equal(detectMediaType(ftypWithSize(0, "isom")), null); // zero-size box
+  assert.equal(detectMediaType(ftypWithSize(8, "isom")), null); // too small to hold a brand
+  assert.equal(detectMediaType(ftypWithSize(22, "isom")), null); // not 4-aligned
+  assert.equal(detectMediaType(ftypWithSize(65536, "isom")), null); // absurd size
+  assert.equal(detectMediaType(ftypWithSize(24, "qtab")), null); // invented qt* brand
+  assert.equal(detectMediaType(ftypWithSize(24, "qt  "))?.extension, "mov"); // exact QuickTime
+  assert.equal(detectMediaType(ftypWithSize(24, "isom"))?.extension, "mp4");
+  // Truncated: real bytes end before the mandatory 16-byte header.
+  const truncated = new Uint8Array(12);
+  truncated.set([0, 0, 0, 24, ...enc.encode("ftypisom")].slice(0, 12));
+  assert.equal(detectMediaType(truncated), null);
+});
+
+test("EBML STRUCTURE: real parser accepts valid webm and rejects every malformation", () => {
+  const magic = [0x1a, 0x45, 0xdf, 0xa3];
+  // Valid: header size 7 containing exactly DocType(0x4282, size 4, "webm").
+  assert.equal(detectWebm(pad([...magic, 0x87, 0x42, 0x82, 0x84, ...enc.encode("webm")])), true);
+  // Matroska DocType inside a valid header.
+  assert.equal(detectWebm(pad([...magic, 0x8b, 0x42, 0x82, 0x88, ...enc.encode("matroska")])), false);
+  // Invalid vint (0x00 first byte has no marker bit).
+  assert.equal(detectWebm(pad([...magic, 0x00, 0x42, 0x82, 0x84, ...enc.encode("webm")])), false);
+  // DocType OUTSIDE the declared header bounds (header size 2, DocType after).
+  assert.equal(detectWebm(pad([...magic, 0x82, 0x00, 0x00, 0x42, 0x82, 0x84, ...enc.encode("webm")])), false);
+  // DocType element overruns the header (size 7 header, DocType claims 20 bytes).
+  assert.equal(detectWebm(pad([...magic, 0x87, 0x42, 0x82, 0x94, ...enc.encode("webm")])), false);
+  // Truncated: header declares more than the sniff window holds.
+  const big = new Uint8Array([...magic, 0xff]); // vint 0xff = size 127, buffer ends
+  assert.equal(detectWebm(big), false);
+  // No DocType in the header at all.
+  assert.equal(detectWebm(pad([...magic, 0x84, 0x42, 0x86, 0x81, 0x01])), false);
+  // Random "webm" bytes with no EBML structure.
+  assert.equal(detectWebm(pad([...magic, ...enc.encode("____webm____")])), false);
+});
+
+test("CONTAINMENT: storage keys cannot escape public/uploads", async () => {
+  const prevCwd = process.cwd();
+  const sandbox = await mkdtemp(path.join(tmpdir(), "snapcast-contain-"));
+  try {
+    process.chdir(sandbox);
+    const { getStorageAdapter } = await import("../storage.ts");
+    const adapter = getStorageAdapter();
+    await assert.rejects(adapter.save("../../escape.txt", Buffer.from("x"), "text/plain"), /outside the uploads/);
+    const src = path.join(sandbox, "ok.bin");
+    await writeFileFs(src, Buffer.from("y"));
+    await assert.rejects(adapter.saveFromFile("../secrets/x.jpg", src, "image/jpeg", 1), /outside the uploads/);
+    // Legitimate nested keys still work.
+    const saved = await adapter.save("evt9/fine.txt", Buffer.from("z"), "text/plain");
+    assert.equal(saved.url, "/uploads/evt9/fine.txt");
+  } finally {
+    process.chdir(prevCwd);
     await rm(sandbox, { recursive: true, force: true });
   }
 });
