@@ -235,7 +235,7 @@ export function resolveRedirect(
 }
 
 // ------------------------------------------------------------ magic bytes --
-interface DetectedType {
+export interface DetectedType {
   kind: "photo" | "video";
   contentType: string;
   extension: string;

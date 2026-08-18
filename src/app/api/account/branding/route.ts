@@ -23,6 +23,10 @@ export async function POST(request: Request) {
   if (typeof body.watermarkOpacity === "number") {
     data.watermarkOpacity = Math.min(1, Math.max(0.05, body.watermarkOpacity));
   }
+  if (typeof body.watermarkScale === "number") {
+    // Same clamp as the renderer: no invisible slivers, no billboards.
+    data.watermarkScale = Math.min(0.4, Math.max(0.1, body.watermarkScale));
+  }
   if (typeof body.brandLogoUrl === "string") {
     data.brandLogoUrl = body.brandLogoUrl.trim() || null;
   }
@@ -40,9 +44,11 @@ export async function POST(request: Request) {
     watermarkEnabled: updated.watermarkEnabled,
     watermarkPosition: updated.watermarkPosition,
     watermarkOpacity: updated.watermarkOpacity,
+    watermarkScale: updated.watermarkScale,
     brandLogoUrl: updated.brandLogoUrl,
-    // The UI needs to know a logo exists — every branding feature is inert
-    // without one, and silently doing nothing is the confusing case.
-    hasLogo: Boolean(updated.brandLogoUrl),
+    // The UI needs to know a logo exists — every logo-driven feature is
+    // inert without one, and silently doing nothing is the confusing case.
+    // An uploaded Brand Kit logo counts the same as a legacy URL.
+    hasLogo: Boolean(updated.brandLogoAssetUrl || updated.brandLogoUrl),
   });
 }

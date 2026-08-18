@@ -32,7 +32,24 @@ model Account {
   periodStartedAt     DateTime @default(now())
 
   // Brand profile, captured via the onboarding style quiz.
-  brandLogoUrl String?
+  //
+  // brandLogoUrl is the LEGACY customer-hosted URL, kept so existing
+  // accounts keep rendering without re-uploading. New uploads store through
+  // the storage abstraction into the asset fields below, which win when set.
+  brandLogoUrl       String?
+  brandLogoAssetPath String?
+  brandLogoAssetUrl  String?
+
+  // Brand Kit intro/outro: a directly-uploaded image or video played before/
+  // after every generated video. "none" | "image" | "video". When "none" but
+  // the legacy introEnabled/outroEnabled toggles are on and a logo exists,
+  // the original generated colour card is used — full backward compat.
+  introKind      String  @default("none")
+  introAssetPath String?
+  introAssetUrl  String?
+  outroKind      String  @default("none")
+  outroAssetPath String?
+  outroAssetUrl  String?
   // "playful" | "elegant" | "professional" — plain string, SQLite has no enum type.
   brandTone    String  @default("playful")
   // JSON-encoded array of hex colors, e.g. ["#7C3AED", "#FF6584"].
@@ -68,6 +85,9 @@ model Account {
   // 0.0–1.0. Default is deliberately semi-transparent: a full-opacity logo
   // over someone's face is worse than no watermark.
   watermarkOpacity  Float   @default(0.65)
+  // Watermark width as a fraction of the frame width. 0.22 matches the
+  // previous hardcoded size.
+  watermarkScale    Float   @default(0.22)
 
   sessions      Session[]
   events        Event[]

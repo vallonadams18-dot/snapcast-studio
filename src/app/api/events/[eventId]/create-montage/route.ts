@@ -206,13 +206,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
 
     let montageBuffer = await readFile(montagePath);
 
-    // Bookends go on BEFORE the music so the track plays across the logo
-    // cards too, rather than starting abruptly after the intro.
-    const branded = await addBrandBookends(
-      montageBuffer,
-      { logoUrl: account.brandLogoUrl, brandColorsJson: account.brandColors, businessName: account.businessName },
-      { intro: account.introEnabled, outro: account.outroEnabled, outroText: account.outroText },
-    );
+    const brandAssets = {
+      logoUrl: account.brandLogoUrl,
+      logoStorageRef: account.brandLogoAssetPath,
+      brandColorsJson: account.brandColors,
+      businessName: account.businessName,
+    };
+
+    // Bookends go on BEFORE the music so the track plays across the intro/
+    // outro too, rather than starting abruptly after them. Uploaded Brand
+    // Kit media wins; the legacy generated logo cards remain the fallback.
+    const branded = await addBrandBookends(montageBuffer, brandAssets, {
+      intro: account.introEnabled,
+      outro: account.outroEnabled,
+      outroText: account.outroText,
+      introMedia: { kind: account.introKind, storageRef: account.introAssetPath },
+      outroMedia: { kind: account.outroKind, storageRef: account.outroAssetPath },
+    });
     if (branded) montageBuffer = branded;
 
     // Measure the video we are actually about to score, rather than
@@ -226,9 +236,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     // is right in all of those cases.
     const measuredPath = path.join(tmpDir, "measured.mp4");
     await writeFile(measuredPath, montageBuffer);
+    // Rough bookend allowance for the probe-failure fallback only — the
+    // probe below measures the real file, which is what actually ships.
     const predictedDuration =
       planDurationSeconds(plan.segments) +
-      (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
+      (branded
+        ? (account.introKind !== "none" || account.introEnabled ? 2 : 0) +
+          (account.outroKind !== "none" || account.outroEnabled ? 2.5 : 0)
+        : 0);
     const totalDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
     // The SAME track object whose BPM shaped the pacing above.
@@ -260,8 +275,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     if (account.watermarkEnabled) {
       const marked = await applyWatermark(
         montageBuffer,
-        { logoUrl: account.brandLogoUrl, brandColorsJson: account.brandColors, businessName: account.businessName },
-        { position: account.watermarkPosition, opacity: account.watermarkOpacity },
+        brandAssets,
+        { position: account.watermarkPosition, opacity: account.watermarkOpacity, scale: account.watermarkScale },
         "video",
       );
       if (marked) montageBuffer = marked;

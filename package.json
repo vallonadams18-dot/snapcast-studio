@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:webhooks": "node --experimental-strip-types --test src/lib/webhooks/request.test.ts src/lib/webhooks/safeDownload.test.ts"
+    "test:webhooks": "node --experimental-strip-types --test src/lib/webhooks/request.test.ts src/lib/webhooks/safeDownload.test.ts",
+    "test:brand": "node --experimental-strip-types --test src/lib/brandAssets.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

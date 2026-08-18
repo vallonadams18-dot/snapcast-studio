@@ -81,15 +81,19 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
 
     const brandAssets = {
       logoUrl: account.brandLogoUrl,
+      logoStorageRef: account.brandLogoAssetPath,
       brandColorsJson: account.brandColors,
       businessName: account.businessName,
     };
 
-    // Bookends before music, so the track carries across the logo cards.
+    // Bookends before music, so the track carries across them. Uploaded
+    // Brand Kit media wins; the legacy generated cards remain the fallback.
     const branded = await addBrandBookends(clipBuffer, brandAssets, {
       intro: account.introEnabled,
       outro: account.outroEnabled,
       outroText: account.outroText,
+      introMedia: { kind: account.introKind, storageRef: account.introAssetPath },
+      outroMedia: { kind: account.outroKind, storageRef: account.outroAssetPath },
     });
     if (branded) clipBuffer = branded;
 
@@ -103,7 +107,10 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
     const predictedDuration =
       window.endSeconds -
       window.startSeconds +
-      (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
+      (branded
+        ? (account.introKind !== "none" || account.introEnabled ? 2 : 0) +
+          (account.outroKind !== "none" || account.outroEnabled ? 2.5 : 0)
+        : 0);
     const clipDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
     // If a licensed library is connected, mix real audio in immediately
@@ -116,7 +123,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ me
       const marked = await applyWatermark(
         clipBuffer,
         brandAssets,
-        { position: account.watermarkPosition, opacity: account.watermarkOpacity },
+        { position: account.watermarkPosition, opacity: account.watermarkOpacity, scale: account.watermarkScale },
         "video",
       );
       if (marked) clipBuffer = marked;

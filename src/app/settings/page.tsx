@@ -29,12 +29,18 @@ export default async function SettingsPage() {
 
       <BrandingPanel
         brandLogoUrl={account.brandLogoUrl}
+        brandLogoAssetUrl={account.brandLogoAssetUrl}
+        introKind={account.introKind}
+        introAssetUrl={account.introAssetUrl}
+        outroKind={account.outroKind}
+        outroAssetUrl={account.outroAssetUrl}
         introEnabled={account.introEnabled}
         outroEnabled={account.outroEnabled}
         outroText={account.outroText}
         watermarkEnabled={account.watermarkEnabled}
         watermarkPosition={account.watermarkPosition}
         watermarkOpacity={account.watermarkOpacity}
+        watermarkScale={account.watermarkScale}
       />
       <GuestPortalToggle initialEnabled={account.guestPortalEnabled} claimCount={claimCount} />
       <WebhookInfo webhookUrl={webhookUrl} secret={account.webhookSecret} />
