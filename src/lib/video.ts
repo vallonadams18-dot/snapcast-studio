@@ -5,7 +5,7 @@ import path from "node:path";
 import { getAnthropicClient } from "@/lib/ai";
 import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
 import { VIDEO_FPS, intermediateEncode, deliveryEncode } from "@/lib/encoding";
-import { photoDurations, type MontageStyle } from "@/lib/montageStyles";
+import { isAllHardCuts, type EditPlan, type EditSegment, type SegmentMotion } from "@/lib/editPlan";
 
 // ffmpeg's filtergraph mini-language treats `:`, `\`, and unescaped `'` as
 // syntax, so any path fed into a filter option (fontfile=, textfile=) needs
@@ -258,6 +258,12 @@ export async function trimVideo(opts: {
   ]);
 }
 
+/**
+ * One frame at 30fps. xfade rejects a zero-length blend, so this is how a
+ * hard cut is expressed inside a chain that also contains real transitions.
+ */
+const CUT_AS_XFADE_SECONDS = 0.034;
+
 // Filter expressions must carry plain decimals — a very small step printed
 // in exponential form (1e-7) is a syntax error inside a filtergraph.
 function fixed(value: number): string {
@@ -275,12 +281,7 @@ function fixed(value: number): string {
 // step = magnitude / (frames - 1) makes the cap a DESTINATION the move
 // actually arrives at, and it stays correct now that segments have
 // different lengths.
-function motionFilter(
-  motion: MontageStyle["motion"],
-  frameCount: number,
-  index: number,
-  magnitude: number,
-): string | null {
+function motionFilter(motion: SegmentMotion, frameCount: number, magnitude: number): string | null {
   if (motion === "none" || magnitude <= 0) return null;
 
   const size = `:d=${frameCount}:s=1080x1920:fps=${VIDEO_FPS}`;
@@ -312,12 +313,6 @@ function motionFilter(
       const panZoom = 1 / (1 - Math.min(0.5, magnitude));
       return `zoompan=z='${fixed(panZoom)}':x='(iw-iw/zoom)*(on/${span})':y='ih/2-(ih/zoom/2)'${size}`;
     }
-    case "alternate":
-      // Alternating push/pull is what gives a fast cut sequence its rhythm —
-      // every photo moving the same direction reads as one long drift.
-      return index % 2 === 0
-        ? `zoompan=${pushIn}${centre}${size}`
-        : `zoompan=${pullBack}${centre}${size}`;
   }
 }
 
@@ -335,17 +330,13 @@ const BLURRED_FIT_FILTER = [
 // One photo → one vertical segment with the style's fit and camera move.
 // Degrades in two steps rather than failing: motion dropped first, then the
 // blurred fit — a plain slideshow still beats losing the feature entirely.
-async function createPhotoSegment(
-  photoPath: string,
-  style: MontageStyle,
-  index: number,
-  outputPath: string,
-  durationSeconds: number,
-): Promise<void> {
-  const frameCount = Math.max(2, Math.round(durationSeconds * VIDEO_FPS));
-  const motion = motionFilter(style.motion, frameCount, index, style.motionMagnitude);
+async function createPhotoSegment(segment: EditSegment, outputPath: string): Promise<void> {
+  const frameCount = Math.max(2, Math.round(segment.durationSeconds * VIDEO_FPS));
+  // Duration, camera move and magnitude all come from THIS segment. Nothing
+  // is inferred from the segment's position — the plan already resolved that.
+  const motion = motionFilter(segment.motion, frameCount, segment.motionMagnitude);
 
-  const inputArgs = ["-loop", "1", "-i", photoPath, "-t", String(durationSeconds)];
+  const inputArgs = ["-loop", "1", "-i", segment.sourcePath, "-t", String(segment.durationSeconds)];
   // Intermediate quality: this segment gets re-encoded at least once more
   // (transition concat, then music, then watermark), so it is encoded finer
   // than delivery to stop those generations compounding.
@@ -360,7 +351,7 @@ async function createPhotoSegment(
   // Ordered best → simplest. First that succeeds wins.
   const attempts: string[][] = [];
 
-  if (style.fit === "blurred") {
+  if (segment.fit === "blurred") {
     const chain = motion ? `${BLURRED_FIT_FILTER},${motion}` : BLURRED_FIT_FILTER;
     attempts.push(["-filter_complex", chain]);
     attempts.push(["-filter_complex", BLURRED_FIT_FILTER]);
@@ -387,32 +378,39 @@ async function createPhotoSegment(
 // can fall back to hard cuts instead of producing nothing.
 async function concatWithTransitions(
   segmentPaths: string[],
-  style: MontageStyle,
-  durations: number[],
+  segments: EditSegment[],
   outputPath: string,
 ): Promise<boolean> {
-  if (style.transition === "cut" || segmentPaths.length < 2) return false;
+  // A plan of nothing but hard cuts has no blends to build; the caller's
+  // concat-demuxer path is both simpler and faster for that case.
+  if (segmentPaths.length < 2 || isAllHardCuts(segments)) return false;
 
   const inputs = segmentPaths.flatMap((p) => ["-i", p]);
-  const d = style.transitionSeconds;
   const steps: string[] = [];
   let current = "[0:v]";
-  // Each xfade overlaps its pair by `d`, so the running length of everything
-  // merged so far shrinks by one `d` per join. The next offset is that
-  // running length minus one more transition.
+  // Each xfade overlaps its pair, so the running length of everything merged
+  // so far shrinks by one transition per join. The next offset is that
+  // running length minus the transition about to be applied.
   //
-  // This accumulates the ACTUAL per-segment durations. It previously reused
-  // one constant for every segment, which was correct only while all photos
-  // were the same length — with variable pacing that assumption silently
-  // drifts the transitions out of place a little further at every join.
-  let elapsed = durations[0];
+  // Both the segment durations AND the transition durations are now read
+  // per-segment. Assuming one shared value for either drifts every
+  // subsequent join a little further out of place.
+  let elapsed = segments[0].durationSeconds;
 
   for (let i = 1; i < segmentPaths.length; i++) {
+    const joining = segments[i - 1];
+    // xfade cannot express a zero-length blend, so a hard cut inside a mixed
+    // chain becomes a single frame of cross-fade — imperceptible at 30fps,
+    // and it lets one video mix rapid cuts with softer transitions.
+    const isCut = joining.transitionOut === "cut" || joining.transitionSeconds <= 0;
+    const d = isCut ? CUT_AS_XFADE_SECONDS : joining.transitionSeconds;
+    const kind = isCut ? "fade" : joining.transitionOut;
+
     const label = i === segmentPaths.length - 1 ? "[out]" : `[v${i}]`;
     const offset = Math.round(Math.max(0, elapsed - d) * 1000) / 1000;
-    steps.push(`${current}[${i}:v]xfade=transition=${style.transition}:duration=${d}:offset=${offset}${label}`);
+    steps.push(`${current}[${i}:v]xfade=transition=${kind}:duration=${d}:offset=${offset}${label}`);
     current = label;
-    elapsed = offset + durations[i];
+    elapsed = offset + segments[i].durationSeconds;
   }
 
   try {
@@ -434,49 +432,35 @@ async function concatWithTransitions(
 }
 
 export interface PhotoMontageOptions {
-  // In display order — first photo opens the video.
-  photoPaths: string[];
-  style: MontageStyle;
+  /** The creative instruction sheet. See lib/editPlan.ts. */
+  plan: EditPlan;
   outputPath: string;
 }
 
-// Predicted runtime of a montage, accounting for transition overlap.
+// Executes an EditPlan. Silent; mix music in separately via
+// lib/music.ts#mixTrackIntoClip, which works on any video whether or not it
+// already has an audio track.
 //
-// This is now only a FALLBACK. Callers that need a real duration to trim
-// music against should probe the rendered file with getVideoDurationSeconds
-// instead: a prediction cannot account for branded bookends, an xfade that
-// silently fell back to hard cuts on an older ffmpeg, or encoder rounding —
-// and each of those shifts the picture's end away from the music's.
-export function montageDurationSeconds(durations: number[], style: MontageStyle): number {
-  const raw = durations.reduce((a, b) => a + b, 0);
-  if (style.transition === "cut" || durations.length < 2) return raw;
-  return raw - (durations.length - 1) * style.transitionSeconds;
-}
-
-// Compiles photos into one vertical video in the chosen style. Silent; mix
-// music in separately via lib/music.ts#mixTrackIntoClip, which works on any
-// video whether or not it already has an audio track.
-export async function createPhotoMontage(options: PhotoMontageOptions): Promise<number[]> {
-  const { style } = options;
-  if (options.photoPaths.length === 0) throw new Error("No photos to compile");
-
-  // Per-photo screen time, varied by the style's pacing profile. Returned to
-  // the caller so it can predict a duration if probing the output fails.
-  const durations = photoDurations(options.photoPaths.length, style);
+// This function makes NO creative decisions. Which photos, in what order,
+// for how long, with which camera move and which transition are all settled
+// before it is called. Its only job is to turn that into ffmpeg.
+export async function createPhotoMontage(options: PhotoMontageOptions): Promise<void> {
+  const segments = options.plan.segments;
+  if (segments.length === 0) throw new Error("No photos to compile");
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-montage-"));
   try {
     const segmentPaths: string[] = [];
-    for (const [i, photoPath] of options.photoPaths.entries()) {
+    for (const [i, segment] of segments.entries()) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
-      await createPhotoSegment(photoPath, style, i, segPath, durations[i]);
+      await createPhotoSegment(segment, segPath);
       segmentPaths.push(segPath);
     }
 
     // Preferred path: real transitions between shots. Returns false on
     // ffmpeg builds without xfade (< 4.3), where we fall through to cuts.
-    if (await concatWithTransitions(segmentPaths, style, durations, options.outputPath)) {
-      return durations;
+    if (await concatWithTransitions(segmentPaths, segments, options.outputPath)) {
+      return;
     }
 
     const concatListPath = path.join(tmpDir, "concat.txt");
@@ -500,7 +484,6 @@ export async function createPhotoMontage(options: PhotoMontageOptions): Promise<
       "-y", options.outputPath,
     ]);
 
-    return durations;
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }

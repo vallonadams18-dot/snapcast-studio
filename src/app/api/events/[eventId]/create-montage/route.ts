@@ -6,7 +6,8 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentAccount } from "@/lib/auth";
 import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
-import { createPhotoMontage, montageDurationSeconds, getVideoDurationSeconds } from "@/lib/video";
+import { createPhotoMontage, getVideoDurationSeconds } from "@/lib/video";
+import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
@@ -92,22 +93,36 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       );
     }
 
-    console.log(
-      `[montage] ${selected.length} photos, ${selection.duplicatesFound} near-duplicates skipped — ` +
-        selection.selected.map((s) => `${s.role}:${s.candidate.id.slice(-6)}`).join(" → "),
-    );
-
-    const photoPaths: string[] = [];
+    // Every selected photo already has a resolved path cached from hashing,
+    // but re-resolving is what proves it is readable before it becomes a
+    // segment.
+    const pathsByMediaId = new Map<string, string>();
     for (const item of selection.selected) {
       const resolved = await resolvePath(item.candidate);
-      if (resolved) photoPaths.push(resolved);
+      if (resolved) pathsByMediaId.set(item.candidate.id, resolved);
     }
 
+    const suggestedTrack = suggestTrackForEventType(event.eventType).id;
+
+    // The creative decisions are all made here, and settled before ffmpeg is
+    // touched. The renderer below only executes this.
+    const plan = buildEditPlan({
+      selection,
+      style,
+      pathsByMediaId,
+      // startSeconds null means "let the high-energy picker choose at mix
+      // time" — the behaviour Phase 1 shipped.
+      music: { catalogId: suggestedTrack, trackId: null, title: null, startSeconds: null },
+    });
+
+    // Answers "why did Snapcast make this edit?" — roles, order, durations,
+    // camera moves and transitions, with no storage paths.
+    console.log(describeEditPlan(plan));
+
     const montagePath = path.join(tmpDir, "montage.mp4");
-    const segmentDurations = await createPhotoMontage({ photoPaths, style, outputPath: montagePath });
+    await createPhotoMontage({ plan, outputPath: montagePath });
 
     let montageBuffer = await readFile(montagePath);
-    const suggestedTrack = suggestTrackForEventType(event.eventType).id;
 
     // Bookends go on BEFORE the music so the track plays across the logo
     // cards too, rather than starting abruptly after the intro.
@@ -130,7 +145,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     const measuredPath = path.join(tmpDir, "measured.mp4");
     await writeFile(measuredPath, montageBuffer);
     const predictedDuration =
-      montageDurationSeconds(segmentDurations, style) +
+      planDurationSeconds(plan.segments) +
       (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
     const totalDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
