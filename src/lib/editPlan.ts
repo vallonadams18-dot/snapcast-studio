@@ -49,6 +49,18 @@ export interface EditPlanMusic {
   title: string | null;
   /** Null means "let the high-energy picker choose at mix time". */
   startSeconds: number | null;
+  /** From the Epidemic API. Null when unknown — never guessed. */
+  bpm: number | null;
+  /**
+   * Seconds between beats, i.e. 60 / bpm.
+   *
+   * IMPORTANT: this is beat SPACING, not beat PHASE. The API gives no
+   * first-beat offset and there is no onset detection here, so cuts land on
+   * musically sensible INTERVALS but are not aligned to the actual downbeats
+   * of the recording. This is rhythm-aware pacing, not phase-locked beat
+   * synchronisation, and it should never be described as the latter.
+   */
+  beatIntervalSeconds: number | null;
 }
 
 export interface EditPlan {
@@ -62,6 +74,103 @@ export interface EditPlan {
   /** Nothing is deleted — this records what was left out, and why. */
   excluded: { mediaId: string; reason: string }[];
   duplicatesFound: number;
+}
+
+/**
+ * Beat multiples a segment may occupy, by pacing character.
+ *
+ * Not one multiple for everything: a Cinematic montage on a 140 BPM track
+ * must not become rapid-fire just because the song is fast, and a Punchy
+ * montage on an 85 BPM track must not turn into a slideshow. Fast profiles
+ * are allowed to sit on shorter multiples, slow ones on longer.
+ */
+function allowedBeatMultiples(style: MontageStyle, beatIntervalSeconds: number): number[] {
+  // Centre on however many beats the style's own shot length occupies at THIS
+  // tempo. A fixed list cannot work: Cinematic's 3.2s shot is 4.5 beats at 85
+  // BPM but 7.0 at 132, so a hardcoded set clamps every segment to its
+  // maximum — which both flattens the pacing profile and drags the runtime
+  // ~18% short, with no headroom left for drift correction to recover.
+  const centre = Math.max(1, Math.round(style.secondsPerPhoto / beatIntervalSeconds));
+  // Fast profiles get more room to vary; slow ones stay near their centre so
+  // a high-BPM track cannot turn Cinematic into rapid cuts.
+  const spread = style.pacing === "accelerate" || style.pacing === "alternating" ? 2 : 1;
+
+  const multiples: number[] = [];
+  for (let m = Math.max(1, centre - spread); m <= centre + spread; m++) multiples.push(m);
+  return multiples;
+}
+
+/**
+ * Nudge durations onto beat-interval multiples.
+ *
+ * The style's pacing profile is the STARTING POINT, not something this
+ * replaces: each duration moves to the nearest allowed multiple of the beat
+ * interval, so an accelerating profile still accelerates and a held hero
+ * shot is still the longest. Only the exact lengths change.
+ *
+ * Beat SPACING only. There is no first-beat offset available, so cuts land
+ * on musically sensible intervals rather than on the recording's actual
+ * downbeats. Rhythm-aware, not phase-locked.
+ */
+function snapDurationsToBeats(
+  durations: number[],
+  beatIntervalSeconds: number,
+  style: MontageStyle,
+): number[] {
+  // A cross-fade longer than its segment breaks xfade outright, so this floor
+  // is a correctness bound and snapping must never cross it.
+  const floor = Math.max(0.8, style.transitionSeconds + 0.35);
+  const multiples = allowedBeatMultiples(style, beatIntervalSeconds).filter((m) => m * beatIntervalSeconds >= floor);
+  if (multiples.length === 0) return durations;
+
+  const snapOne = (seconds: number) =>
+    multiples.reduce((best, m) => {
+      const candidate = m * beatIntervalSeconds;
+      return Math.abs(candidate - seconds) < Math.abs(best - seconds) ? candidate : best;
+    }, multiples[0] * beatIntervalSeconds);
+
+  const snapped = durations.map(snapOne);
+
+  // Drift control. Snapping eight segments in the same direction compounds,
+  // so if the total strays far from the style's intent, step individual
+  // segments to a neighbouring multiple — rather than rescaling everything,
+  // which would immediately pull them all back off the beat.
+  const target = durations.reduce((a, b) => a + b, 0);
+  const maxDrift = 0.1;
+  for (let guard = 0; guard < snapped.length * 2; guard++) {
+    const total = snapped.reduce((a, b) => a + b, 0);
+    const drift = (total - target) / target;
+    if (Math.abs(drift) <= maxDrift) break;
+
+    // Adjust the segment furthest from its original length, so the shape of
+    // the pacing profile survives.
+    const direction = drift > 0 ? -1 : 1;
+    let bestIndex = -1;
+    let bestGain = 0;
+    snapped.forEach((current, i) => {
+      const currentMultiple = Math.round(current / beatIntervalSeconds);
+      const nextMultiple = currentMultiple + direction;
+      if (!multiples.includes(nextMultiple)) return;
+      const gain = Math.abs(current - durations[i]) - Math.abs(nextMultiple * beatIntervalSeconds - durations[i]);
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestIndex = i;
+      }
+    });
+    if (bestIndex < 0) break;
+    snapped[bestIndex] = (Math.round(snapped[bestIndex] / beatIntervalSeconds) + direction) * beatIntervalSeconds;
+  }
+
+  // Some tempos simply cannot express a style. Punchy wants ~0.9s shots, but
+  // at 85 BPM one beat is 0.706s — below the transition-safety floor — so the
+  // shortest legal multiple is two beats at 1.41s and the runtime inflates
+  // over 13%. When rhythm and style intent genuinely cannot both be met,
+  // style intent wins: the music-aware layer is meant to REFINE pacing, not
+  // stretch a fast edit into a slow one.
+  const finalDrift = Math.abs(snapped.reduce((a, b) => a + b, 0) - target) / target;
+  if (finalDrift > maxDrift) return durations;
+
+  return snapped.map((d) => Math.round(Math.max(floor, d) * 1000) / 1000);
 }
 
 /**
@@ -97,7 +206,16 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
 
   // Only photos we can actually read become segments.
   const usable: SelectedPhoto<T>[] = selection.selected.filter((s) => pathsByMediaId.has(s.candidate.id));
-  const durations = photoDurations(usable.length, style);
+
+  // Style intent first, then music rhythm refines it. When BPM is unknown
+  // the style profile is used exactly as Phase 1 and 2B shipped it —
+  // rhythm-aware pacing is an enhancement, never a render dependency.
+  const styleDurations = photoDurations(usable.length, style);
+  const beatInterval = music?.beatIntervalSeconds ?? null;
+  const durations =
+    beatInterval && beatInterval > 0
+      ? snapDurationsToBeats(styleDurations, beatInterval, style)
+      : styleDurations;
 
   const segments: EditSegment[] = usable.map((item, index) => ({
     mediaId: item.candidate.id,

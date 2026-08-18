@@ -46,9 +46,11 @@ function getEpidemicApiKey(): string | null {
   return key;
 }
 
-interface EpidemicSearchResult {
+export interface ResolvedTrack {
   id: string;
   title: string;
+  /** Beats per minute from the API. Gives beat SPACING, never phase. */
+  bpm: number | null;
   // Carried through so a montage can start the track at a loud section
   // rather than 0:00. Both come back on the same search response the picker
   // already uses — they were simply being discarded here.
@@ -255,7 +257,7 @@ async function runEpidemicSearch(
   params: URLSearchParams,
   /** When true, report no match rather than settling for instrumentals. */
   requireVocals = false,
-): Promise<EpidemicSearchResult | null> {
+): Promise<ResolvedTrack | null> {
   const response = await fetch(`${EPIDEMIC_API_BASE}/tracks/search?${params}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
   });
@@ -299,12 +301,22 @@ async function runEpidemicSearch(
   return {
     id: track.id,
     title: track.title,
+    bpm: track.bpm ?? null,
     waveformUrl: track.waveformUrl ?? null,
     lengthSeconds: track.length ?? null,
   };
 }
 
-async function searchEpidemicTrack(catalogId: string): Promise<EpidemicSearchResult | null> {
+/**
+ * Resolve a catalog category to ONE concrete track.
+ *
+ * Exported so the montage pipeline can resolve the track BEFORE building its
+ * edit plan — the plan needs the BPM, and the track used to derive that BPM
+ * must be the track that ends up in the video. Selection is randomised among
+ * the strongest candidates, so searching twice would give two different
+ * tracks and the pacing would be snapped to music nobody hears.
+ */
+export async function resolveTrackForCategory(catalogId: string): Promise<ResolvedTrack | null> {
   const apiKey = getEpidemicApiKey();
   const query = EPIDEMIC_SEARCH[catalogId];
   if (!apiKey || !query) return null;
@@ -383,18 +395,23 @@ export async function mixTrackIntoClip(
   // Where in the track to start, in seconds. Lets the client choose the
   // drop/chorus rather than always getting the intro.
   startSeconds?: number | null,
+  // A track already resolved by the caller. Supplying this GUARANTEES the
+  // track whose BPM shaped the edit is the track that ends up in the video:
+  // auto-selection is randomised, so searching a second time here would pick
+  // a different song and the pacing would be snapped to music nobody hears.
+  preResolved?: ResolvedTrack | null,
   // NonSharedBuffer (what fs.readFile returns) rather than plain Buffer, so
   // callers can reassign the result onto a readFile-derived variable.
 ): Promise<Buffer<ArrayBuffer> | null> {
   const apiKey = getEpidemicApiKey();
   if (!apiKey) return null;
 
-  let trackId = explicitTrackId ?? null;
-  let waveformUrl: string | null = null;
-  let trackLengthSeconds: number | null = null;
+  let trackId = preResolved?.id ?? explicitTrackId ?? null;
+  let waveformUrl: string | null = preResolved?.waveformUrl ?? null;
+  let trackLengthSeconds: number | null = preResolved?.lengthSeconds ?? null;
 
   if (!trackId) {
-    const found = await searchEpidemicTrack(catalogId);
+    const found = await resolveTrackForCategory(catalogId);
     if (!found) {
       console.error("[music] No Epidemic Sound match for catalog category", catalogId);
       return null;

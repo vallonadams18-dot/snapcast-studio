@@ -8,7 +8,7 @@ import { getMediaBytes } from "@/lib/media";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
 import { createPhotoMontage, getVideoDurationSeconds } from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
-import { mixTrackIntoClip } from "@/lib/music";
+import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
 import { suggestTrackForEventType } from "@/lib/musicCatalog";
 import { getMontageStyle, suggestStyleForEventType } from "@/lib/montageStyles";
 import { analyzeClip, PLATFORMS } from "@/lib/ai";
@@ -104,6 +104,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
 
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
 
+    // Resolve the ACTUAL track before planning, so its BPM can shape the
+    // pacing. Auto-selection is randomised, so this same resolved track is
+    // handed to the mixer below — searching a second time would score the
+    // edit to one song and then play a different one.
+    //
+    // Failure here is not fatal. A missing key, an outage or a track with no
+    // BPM simply leaves beatIntervalSeconds null, the plan falls back to
+    // style-only pacing, and the mixer behaves exactly as it did before.
+    const track = await resolveTrackForCategory(suggestedTrack).catch(() => null);
+    const beatIntervalSeconds = track?.bpm ? 60 / track.bpm : null;
+
     // The creative decisions are all made here, and settled before ffmpeg is
     // touched. The renderer below only executes this.
     const plan = buildEditPlan({
@@ -112,7 +123,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       pathsByMediaId,
       // startSeconds null means "let the high-energy picker choose at mix
       // time" — the behaviour Phase 1 shipped.
-      music: { catalogId: suggestedTrack, trackId: null, title: null, startSeconds: null },
+      music: {
+        catalogId: suggestedTrack,
+        trackId: track?.id ?? null,
+        title: track?.title ?? null,
+        startSeconds: null,
+        bpm: track?.bpm ?? null,
+        beatIntervalSeconds,
+      },
     });
 
     // Answers "why did Snapcast make this edit?" — roles, order, durations,
@@ -149,7 +167,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       (branded ? (account.introEnabled ? 1.5 : 0) + (account.outroEnabled ? 2 : 0) : 0);
     const totalDuration = await getVideoDurationSeconds(measuredPath).catch(() => predictedDuration);
 
-    const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration);
+    // The SAME track object whose BPM shaped the pacing above.
+    const mixed = await mixTrackIntoClip(montageBuffer, suggestedTrack, totalDuration, null, null, track);
+    console.log(
+      `[music] planned with track=${track?.id ?? "none"} bpm=${track?.bpm ?? "unknown"} ` +
+        `beat=${beatIntervalSeconds ? `${beatIntervalSeconds.toFixed(3)}s` : "n/a"} | ` +
+        `mixed track=${track?.id ?? "resolved-at-mix"}`,
+    );
     if (mixed) montageBuffer = mixed;
 
     if (account.watermarkEnabled) {
