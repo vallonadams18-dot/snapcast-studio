@@ -1,5 +1,5 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
+import { readBoundedJsonBody, decodeUtf8Strict, verifyWebhookSignature } from "@/lib/webhooks/request";
 import { prisma } from "@/lib/prisma";
 import { rateLimit } from "@/lib/rateLimit";
 import { getStorageAdapter, randomFileKey } from "@/lib/storage";
@@ -22,31 +22,38 @@ interface RawWebhookPayload {
   event_id?: string;
 }
 
-function verifySignature(rawBody: string, signatureHeader: string | null, secret: string): boolean {
-  if (!signatureHeader) return false;
-
-  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
-  const expectedBuf = Buffer.from(expected, "utf8");
-  const providedBuf = Buffer.from(signatureHeader.trim(), "utf8");
-
-  if (expectedBuf.length !== providedBuf.length) return false;
-  return timingSafeEqual(expectedBuf, providedBuf);
-}
-
 export async function POST(request: Request, { params }: { params: Promise<{ accountId: string }> }) {
   const { accountId } = await params;
 
   const account = await prisma.account.findUnique({ where: { id: accountId } });
   if (!account) return NextResponse.json({ error: "unknown account" }, { status: 404 });
 
-  // Generous enough for booth bursts (multiple guests capturing back-to-back).
+  // Bounded intake first: content-type/encoding checks, a 64 KiB cap
+  // enforced on ACTUAL bytes (a lying Content-Length doesn't help), and no
+  // decoding — HMAC below runs on the exact bytes received. Previously this
+  // was an unbounded request.text(), and the HMAC ran over the DECODED
+  // string, so invalid UTF-8 was U+FFFD-substituted before verification.
+  const body = await readBoundedJsonBody(request);
+  if (!body.ok) return NextResponse.json({ error: body.error }, { status: body.status });
+
+  if (!verifyWebhookSignature(body.bytes, request.headers.get("x-signature"), account.webhookSecret)) {
+    return NextResponse.json({ error: "invalid signature" }, { status: 401 });
+  }
+
+  // Quota AFTER verification, deliberately: this bucket is the customer's
+  // legitimate delivery allowance, and consuming it on unauthenticated
+  // requests would let anyone who merely knows an account id starve that
+  // customer's real booth pushes. Unverified traffic never touches it —
+  // the work done before this point is a lookup, a capped read, and one
+  // HMAC over at most 64 KiB. Generous enough for booth bursts.
   if (!rateLimit(`webhook:${accountId}`, 120, 60 * 1000)) {
     return NextResponse.json({ error: "rate limit exceeded" }, { status: 429 });
   }
 
-  const rawBody = await request.text();
-  if (!verifySignature(rawBody, request.headers.get("x-signature"), account.webhookSecret)) {
-    return NextResponse.json({ error: "invalid signature" }, { status: 401 });
+  // Strict decode only now, after the signature attested the bytes.
+  const rawBody = decodeUtf8Strict(body.bytes);
+  if (rawBody === null) {
+    return NextResponse.json({ error: "body is not valid UTF-8" }, { status: 400 });
   }
 
   let parsed: RawWebhookPayload;

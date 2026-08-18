@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:webhooks": "node --experimental-strip-types --test src/lib/webhooks/request.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
