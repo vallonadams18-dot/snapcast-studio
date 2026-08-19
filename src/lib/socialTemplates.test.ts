@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EVENT_IN_20_TEMPLATE, expandSelectionForTemplate } from "./socialTemplates.ts";
+import {
+  EVENT_IN_20_TEMPLATE,
+  INSTANT_HYPE_TEMPLATE,
+  LOVE_STORY_TEMPLATE,
+  SOCIAL_TEMPLATES,
+  expandSelectionForTemplate,
+} from "./socialTemplates.ts";
 import type { SelectionCandidate, SelectionResult } from "./photoSelection.ts";
 import { buildEditPlan, planDurationSeconds } from "./editPlan.ts";
 import { getMontageStyle } from "./montageStyles.ts";
@@ -79,6 +85,93 @@ test("expanded edit caps slots while preserving opener and hero", () => {
   const predicted = result.selected.reduce((total, item) => total + (item.durationSeconds ?? 0), 0) -
     (result.selected.length - 1) * 0.3;
   assert.ok(Math.abs(predicted - EVENT_IN_20_TEMPLATE.targetDurationSeconds) < 0.02);
+});
+
+test("Instant Hype opens with a one-second flash of the hero it ends on", () => {
+  const selected = Array.from({ length: 7 }, (_, index) => ({
+    candidate: candidate(`m-${index}`, "photo" as const),
+    role: index === 0 ? ("opener" as const) : index === 6 ? ("hero" as const) : ("build" as const),
+    reason: "selected",
+  }));
+  const selection: SelectionResult = { selected, excluded: [], duplicatesFound: 0 };
+
+  const result = expandSelectionForTemplate(selection, INSTANT_HYPE_TEMPLATE, new Map());
+  const slots = result.selected;
+  const hero = slots.at(-1)!;
+
+  // The tease IS the hero's media, one second, in the opener slot.
+  assert.equal(slots[0].role, "opener");
+  assert.equal(slots[0].candidate.id, hero.candidate.id);
+  assert.equal(slots[0].durationSeconds, 1);
+  assert.equal(hero.role, "hero");
+  // The hero out-holds everything; the middles are rapid bursts.
+  for (const slot of slots.slice(1, -1)) {
+    assert.ok((hero.durationSeconds ?? 0) > (slot.durationSeconds ?? 0));
+    assert.ok((slot.durationSeconds ?? 0) >= INSTANT_HYPE_TEMPLATE.slotClampSeconds.min);
+    assert.ok((slot.durationSeconds ?? 0) <= INSTANT_HYPE_TEMPLATE.slotClampSeconds.max);
+  }
+  // Runtime lands near 12s once per-join overlap is subtracted.
+  const predicted =
+    slots.reduce((total, item) => total + (item.durationSeconds ?? 0), 0) -
+    (slots.length - 1) * INSTANT_HYPE_TEMPLATE.transitionAllowancePerJoin;
+  assert.ok(Math.abs(predicted - INSTANT_HYPE_TEMPLATE.targetDurationSeconds) < 1);
+
+  // Determinism: same inputs, byte-identical plan.
+  const again = expandSelectionForTemplate(selection, INSTANT_HYPE_TEMPLATE, new Map());
+  assert.deepEqual(
+    again.selected.map((s) => [s.candidate.id, s.role, s.durationSeconds]),
+    slots.map((s) => [s.candidate.id, s.role, s.durationSeconds]),
+  );
+});
+
+test("Instant Hype flash never exceeds maxSegments", () => {
+  const selected = Array.from({ length: 14 }, (_, index) => ({
+    candidate: candidate(`m-${index}`, "photo" as const),
+    role: index === 0 ? ("opener" as const) : index === 13 ? ("hero" as const) : ("build" as const),
+    reason: "selected",
+  }));
+  const selection: SelectionResult = { selected, excluded: [], duplicatesFound: 0 };
+  const result = expandSelectionForTemplate(selection, INSTANT_HYPE_TEMPLATE, new Map());
+  assert.ok(result.selected.length <= INSTANT_HYPE_TEMPLATE.maxSegments);
+  assert.equal(result.selected[0].candidate.id, result.selected.at(-1)!.candidate.id);
+});
+
+test("Love Story holds longer, builds gently, and never flashes", () => {
+  const selected = Array.from({ length: 7 }, (_, index) => ({
+    candidate: candidate(`w-${index}`, index === 3 ? ("video" as const) : ("photo" as const)),
+    role: index === 0 ? ("opener" as const) : index === 6 ? ("hero" as const) : ("build" as const),
+    reason: "selected",
+  }));
+  const selection: SelectionResult = { selected, excluded: [], duplicatesFound: 0 };
+  const scenes = new Map([["w-3", [{ startSeconds: 2, endSeconds: 7 }]]]);
+
+  const result = expandSelectionForTemplate(selection, LOVE_STORY_TEMPLATE, scenes);
+  const slots = result.selected;
+
+  // No hero flash: the opener is its own moment, not a tease.
+  assert.notEqual(slots[0].candidate.id, slots.at(-1)!.candidate.id);
+  assert.equal(slots[0].role, "opener");
+  assert.equal(slots.at(-1)!.role, "hero");
+  // Every hold is unhurried — the emotional pacing floor.
+  for (const slot of slots) {
+    assert.ok((slot.durationSeconds ?? 0) >= LOVE_STORY_TEMPLATE.slotClampSeconds.min);
+  }
+  // The hero is the longest hold in the video.
+  const heroSeconds = slots.at(-1)!.durationSeconds ?? 0;
+  for (const slot of slots.slice(0, -1)) assert.ok(heroSeconds >= (slot.durationSeconds ?? 0));
+  const predicted =
+    slots.reduce((total, item) => total + (item.durationSeconds ?? 0), 0) -
+    (slots.length - 1) * LOVE_STORY_TEMPLATE.transitionAllowancePerJoin;
+  assert.ok(Math.abs(predicted - LOVE_STORY_TEMPLATE.targetDurationSeconds) < 1);
+});
+
+test("all templates carry a coherent narrative policy", () => {
+  for (const t of SOCIAL_TEMPLATES) {
+    assert.ok(t.slotWeights.hero > t.slotWeights.middle, `${t.id}: hero must out-weigh the middle`);
+    assert.ok(t.slotClampSeconds.min < t.slotClampSeconds.max, `${t.id}: clamp range`);
+    assert.ok(t.peakPosition > 0.5 && t.peakPosition < 0.9, `${t.id}: peak sits late-middle`);
+    if (t.heroFlashSeconds !== null) assert.ok(t.heroFlashSeconds <= 1.5, `${t.id}: a flash is a tease, not a scene`);
+  }
 });
 
 test("one long video can fill six distinct slots near the target runtime", () => {

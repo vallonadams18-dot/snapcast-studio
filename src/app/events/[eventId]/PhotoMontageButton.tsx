@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui";
 import { ErrorState, SuccessBanner } from "@/components/States";
 import { MONTAGE_STYLES } from "@/lib/montageStyles";
-import { EVENT_IN_20_TEMPLATE } from "@/lib/socialTemplates";
+import { SOCIAL_TEMPLATES, EVENT_IN_20_TEMPLATE, type SocialTemplate } from "@/lib/socialTemplates";
 
 export function PhotoMontageButton({
   eventId,
@@ -63,9 +63,11 @@ export function PhotoMontageButton({
   }
 
   const working = status === "working";
-  const templateEligible = readySourceCount >= 2 || readyVideoCount > 0;
-  const canGenerate = templateId === EVENT_IN_20_TEMPLATE.id ? templateEligible : readySourceCount >= 2;
-  const sourcesNeeded = Math.max(0, 2 - readySourceCount);
+  const eligible = (t: SocialTemplate) =>
+    readySourceCount >= t.minSourceAssets || (t.allowsSingleVideo && readyVideoCount > 0);
+  const selectedTemplate = SOCIAL_TEMPLATES.find((t) => t.id === templateId) ?? null;
+  const canGenerate = selectedTemplate ? eligible(selectedTemplate) : readySourceCount >= 2;
+  const sourcesNeeded = Math.max(0, (selectedTemplate?.minSourceAssets ?? 2) - readySourceCount);
 
   return (
     <div className="mt-4 rounded-xl border border-border bg-surface p-4">
@@ -77,26 +79,34 @@ export function PhotoMontageButton({
       </p>
 
       <div className="mt-3">
-        <p className="mb-2 text-xs font-medium text-foreground">Featured template</p>
-        <button
-          type="button"
-          onClick={() => setTemplateId(EVENT_IN_20_TEMPLATE.id)}
-          disabled={working || !templateEligible}
-          className={`tap-scale min-h-11 w-full rounded-xl border p-3 text-left disabled:opacity-60 ${
-            templateId === EVENT_IN_20_TEMPLATE.id
-              ? "border-primary-pink bg-gradient-to-r from-primary-purple/10 to-primary-pink/10"
-              : "border-border bg-background hover:border-primary-pink/50"
-          }`}
-        >
-          <span className="flex items-center justify-between gap-2 text-sm font-semibold text-foreground">
-            {EVENT_IN_20_TEMPLATE.name}
-            <span className="rounded-full bg-primary-pink/15 px-2 py-1 text-[10px] font-medium text-primary-pink">NEW</span>
-          </span>
-          <span className="mt-1 block text-xs leading-relaxed text-neutral-500">
-            {EVENT_IN_20_TEMPLATE.description} A long upload can supply several different scenes.
-          </span>
-          <span className="mt-2 block text-[10px] font-medium text-primary-pink">About 20 seconds · photos + video</span>
-        </button>
+        <p className="mb-2 text-xs font-medium text-foreground">Templates</p>
+        <div className="flex flex-col gap-2">
+          {SOCIAL_TEMPLATES.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setTemplateId(t.id)}
+              disabled={working || !eligible(t)}
+              className={`tap-scale min-h-11 w-full rounded-xl border p-3 text-left disabled:opacity-60 ${
+                templateId === t.id
+                  ? "border-primary-pink bg-gradient-to-r from-primary-purple/10 to-primary-pink/10"
+                  : "border-border bg-background hover:border-primary-pink/50"
+              }`}
+            >
+              <span className="flex items-center justify-between gap-2 text-sm font-semibold text-foreground">
+                {t.name}
+                <span className="shrink-0 rounded-full bg-primary-pink/15 px-2 py-1 text-[10px] font-medium text-primary-pink">
+                  ~{t.targetDurationSeconds}s
+                </span>
+              </span>
+              <span className="mt-1 block text-xs leading-relaxed text-neutral-500">{t.description}</span>
+              <span className="mt-2 block text-[10px] font-medium text-primary-pink">
+                Photos + video{t.allowsSingleVideo ? " · works from a single video" : ""}
+                {!eligible(t) ? ` · needs ${t.minSourceAssets}+ items` : ""}
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="mt-3">
@@ -133,8 +143,8 @@ export function PhotoMontageButton({
         {working
           ? "Compiling video… (this takes a minute)"
           : canGenerate
-            ? templateId
-              ? `Use ${EVENT_IN_20_TEMPLATE.name}`
+            ? selectedTemplate
+              ? `Use ${selectedTemplate.name}`
               : "Create video"
             : `Add ${sourcesNeeded} more to create`}
       </Button>
