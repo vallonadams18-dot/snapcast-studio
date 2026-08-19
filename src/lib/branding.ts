@@ -139,13 +139,22 @@ async function createImageBookend(opts: {
 }): Promise<void> {
   const { imagePath, durationSeconds, outputPath } = opts;
   const frames = Math.max(2, Math.round(durationSeconds * FPS));
+  // Transparent PNGs must be flattened onto a solid base: video has no
+  // alpha channel, so any pixel left transparent would composite to BLACK
+  // at the final yuv420p conversion — a client's transparent-background
+  // logo card rendered with black blotches. Compose the blurred-fit frame
+  // in rgba, then lay the whole thing over white before scaling/motion.
+  const flatten =
+    `color=c=white:s=${WIDTH}x${HEIGHT}[bk_base];` +
+    `[0:v]format=rgba,${BLURRED_FIT}[bk_comp];` +
+    `[bk_base][bk_comp]overlay=shortest=1`;
   // Compose the framed still, oversample it, then let zoompan run a gentle
   // 6% push-in across the whole hold. The 2x oversample keeps zoompan's
   // moving crop window from stair-stepping.
   const motionGraph =
-    `[0:v]${BLURRED_FIT},scale=${WIDTH * 2}:${HEIGHT * 2},` +
+    `${flatten},scale=${WIDTH * 2}:${HEIGHT * 2},` +
     `zoompan=z='1+0.06*on/${frames - 1}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS}[v]`;
-  const staticGraph = `[0:v]${BLURRED_FIT}[v]`;
+  const staticGraph = `${flatten}[v]`;
 
   const build = (graph: string, still: boolean) => [
     // The motion graph feeds zoompan ONE frame and lets it generate the

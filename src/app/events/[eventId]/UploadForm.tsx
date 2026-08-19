@@ -13,24 +13,28 @@ export function UploadForm({ eventId }: { eventId: string }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
-  // 0-100 while bytes are in flight; null once the server is processing.
-  const [progress, setProgress] = useState<number | null>(null);
+  // "Uploading 3 of 11 — 47%" / "Processing 3 of 11…" while work is in flight.
+  const [statusLine, setStatusLine] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [lastFiles, setLastFiles] = useState<FileList | null>(null);
+  // Only the files that FAILED, so retry never re-uploads what already landed.
+  const [failedFiles, setFailedFiles] = useState<File[]>([]);
 
   // XHR instead of fetch purely for upload.onprogress: a multi-minute video
   // upload with no moving number is indistinguishable from a hang.
-  function uploadWithProgress(formData: FormData): Promise<{ status: number; body: Record<string, unknown> }> {
+  function uploadOne(
+    file: File,
+    onProgress: (percent: number | null) => void,
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `/api/events/${eventId}/media`);
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) setProgress(Math.min(100, Math.round((e.loaded / e.total) * 100)));
+        if (e.lengthComputable) onProgress(Math.min(100, Math.round((e.loaded / e.total) * 100)));
       };
       // All bytes sent — the server is now validating and generating drafts.
-      xhr.upload.onload = () => setProgress(null);
+      xhr.upload.onload = () => onProgress(null);
       xhr.onload = () => {
         let body: Record<string, unknown> = {};
         try {
@@ -41,55 +45,87 @@ export function UploadForm({ eventId }: { eventId: string }) {
         resolve({ status: xhr.status, body });
       };
       xhr.onerror = () => reject(new Error("network"));
+      const formData = new FormData();
+      formData.append("files", file);
       xhr.send(formData);
     });
   }
 
-  async function handleFiles(files: FileList | null) {
+  // Files upload ONE PER REQUEST, sequentially. A whole camera-roll
+  // selection in a single request used to blow through the server's
+  // per-request body cap and stall with no error — clients select a dozen
+  // rough videos at once, and that must just work. Sequential also means
+  // one broken file costs only itself, and progress can say which file
+  // it's on instead of a meaningless combined percentage.
+  async function handleFiles(files: FileList | File[] | null) {
     // Guard against double submission: picking more files while an upload
     // is running would fire a second concurrent request.
     if (uploading) return;
-    if (!files || files.length === 0) return;
-    setLastFiles(files);
+    const all = files ? Array.from(files) : [];
+    if (all.length === 0) return;
     setError(null);
     setWarning(null);
     setSuccess(null);
+    setFailedFiles([]);
 
-    const oversized = Array.from(files).find((f) => f.size > MAX_UPLOAD_BYTES);
-    if (oversized) {
-      setError(`${oversized.name} is too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB).`);
+    // Oversized files are SKIPPED, not batch-blocking: one huge screen
+    // recording shouldn't hold ten good clips hostage.
+    const skipped = all.filter((f) => f.size > MAX_UPLOAD_BYTES);
+    const queue = all.filter((f) => f.size <= MAX_UPLOAD_BYTES);
+    const problems: string[] = skipped.map(
+      (f) => `${f.name} is too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB) — skipped.`,
+    );
+    if (queue.length === 0) {
+      setError(problems.join(" "));
       if (inputRef.current) inputRef.current.value = "";
       return;
     }
 
     setUploading(true);
-    setProgress(0);
-    const formData = new FormData();
-    for (const file of Array.from(files)) formData.append("files", file);
+    const failed: File[] = [];
+    let uploadedCount = 0;
 
-    try {
-      const { status, body } = await uploadWithProgress(formData);
-
-      if (status < 200 || status >= 300) {
-        setError(
-          typeof body.error === "string"
-            ? body.error
-            : "We couldn't upload that — check your connection and try again.",
+    for (let i = 0; i < queue.length; i++) {
+      const file = queue[i];
+      const label = `${i + 1} of ${queue.length}`;
+      setStatusLine(`Uploading ${label} — 0%`);
+      try {
+        const { status, body } = await uploadOne(file, (percent) =>
+          setStatusLine(percent === null ? `Processing ${label}…` : `Uploading ${label} — ${percent}%`),
         );
-      } else {
-        const count = Array.isArray(body.media) ? body.media.length : files.length;
-        setSuccess(`${count} file${count === 1 ? "" : "s"} uploaded — drafts are ready to review.`);
-        // Partial failures (one bad file in a batch) arrive as a warning
-        // beside the successes — surface them or the client never learns.
-        if (typeof body.warning === "string") setWarning(body.warning);
+        if (status >= 200 && status < 300) {
+          uploadedCount += Array.isArray(body.media) ? body.media.length : 1;
+          if (typeof body.warning === "string") problems.push(body.warning);
+        } else {
+          failed.push(file);
+          // Server messages usually already name the file — don't say it twice.
+          const msg = typeof body.error === "string" ? body.error : "upload failed.";
+          problems.push(msg.includes(file.name) ? msg : `${file.name}: ${msg}`);
+        }
+      } catch {
+        failed.push(file);
+        problems.push(`${file.name}: connection dropped.`);
       }
-    } catch {
-      setError("We couldn't reach the server. Check your connection and try again.");
     }
 
     setUploading(false);
-    setProgress(null);
+    setStatusLine(null);
+    setFailedFiles(failed);
     if (inputRef.current) inputRef.current.value = "";
+
+    if (uploadedCount > 0) {
+      setSuccess(`${uploadedCount} file${uploadedCount === 1 ? "" : "s"} uploaded — drafts are ready to review.`);
+    }
+    if (failed.length > 0) {
+      setError(
+        `${failed.length} file${failed.length === 1 ? "" : "s"} didn't make it. ` +
+          problems.slice(0, 3).join(" ") +
+          (problems.length > 3 ? ` (+${problems.length - 3} more)` : ""),
+      );
+    } else if (problems.length > 0) {
+      // Non-fatal notes only (skipped-oversized, per-file server warnings).
+      setWarning(problems.slice(0, 3).join(" ") + (problems.length > 3 ? ` (+${problems.length - 3} more)` : ""));
+    }
     router.refresh();
   }
 
@@ -113,16 +149,17 @@ export function UploadForm({ eventId }: { eventId: string }) {
         className={uploading ? "pointer-events-none opacity-60" : ""}
         aria-disabled={uploading}
       >
-        {uploading
-          ? progress !== null
-            ? `Uploading… ${progress}%`
-            : "Processing & generating drafts…"
-          : "Upload photos or video"}
+        {uploading ? (statusLine ?? "Uploading…") : "Upload photos or video"}
       </ButtonLabel>
-      <p className="mt-2 text-xs text-neutral-500">Drafts are generated automatically after upload.</p>
+      <p className="mt-2 text-xs text-neutral-500">
+        Select as many as you like — they upload one at a time. Drafts are generated automatically.
+      </p>
       {error && (
         <div className="mt-3 text-left">
-          <ErrorState message={error} onRetry={() => handleFiles(lastFiles)} />
+          <ErrorState
+            message={error}
+            onRetry={failedFiles.length > 0 ? () => handleFiles(failedFiles) : undefined}
+          />
         </div>
       )}
       {warning && (
