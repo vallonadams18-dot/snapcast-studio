@@ -5,6 +5,7 @@ import path from "node:path";
 import { getAnthropicClient } from "@/lib/ai";
 import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
 import { VIDEO_FPS, intermediateEncode, deliveryEncode } from "@/lib/encoding";
+import { parseFfmpegDuration } from "@/lib/probeParsing";
 import { isAllHardCuts, type EditPlan, type EditSegment, type SegmentMotion } from "@/lib/editPlan";
 
 // ffmpeg's filtergraph mini-language treats `:`, `\`, and unescaped `'` as
@@ -35,18 +36,27 @@ function runFfmpeg(args: string[]): Promise<string> {
 }
 
 export async function getVideoDurationSeconds(filePath: string): Promise<number> {
-  let output = "";
-  try {
-    output = await runFfmpeg(["-i", filePath]);
-  } catch (err) {
-    // ffmpeg with no output file always "fails" — the info we need is in
-    // the error's captured stderr.
-    output = err instanceof Error ? err.message : "";
-  }
-  const match = output.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  if (!match) throw new Error("Could not determine video duration");
-  const [, hours, minutes, seconds] = match;
-  return Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds);
+  // `ffmpeg -i` with no output exits non-zero BY DESIGN — the header info
+  // lands on stderr. The FULL stderr must be parsed, never the tail of an
+  // Error message: runFfmpeg's error truncates stderr to its last 2000
+  // chars, and a metadata-heavy container (every real iPhone .mov — extra
+  // streams, QuickTime tags, colour info) pushes `Duration:` past that
+  // cut. That truncation had the upload validator rejecting perfectly good
+  // customer videos as "corrupt".
+  const output = await new Promise<string>((resolve, reject) => {
+    const proc = spawn(resolveFfmpegPath(), ["-i", filePath]);
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      // A container would have to be pathological to print more header
+      // than this; cap so a hostile file can't balloon memory.
+      if (stderr.length < 512 * 1024) stderr += chunk.toString();
+    });
+    proc.on("error", reject);
+    proc.on("close", () => resolve(stderr));
+  });
+  const duration = parseFfmpegDuration(output);
+  if (duration === null) throw new Error("Could not determine video duration");
+  return duration;
 }
 
 /**

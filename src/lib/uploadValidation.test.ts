@@ -89,3 +89,46 @@ test("stored extension follows detection, never the filename", () => {
   assert.equal(keyNameWithDetectedExtension(".mp4", "mp4"), "upload.mp4");
   assert.equal(keyNameWithDetectedExtension("my cool vidéo (1).mp4", "mp4"), "my cool vidéo (1).mp4");
 });
+
+// ---------------------------------------------------------------- probe ---
+// Regression for the iPhone-video rejection: the intake probe parsed
+// `Duration:` out of an Error message that kept only the LAST 2000 chars of
+// ffmpeg's output. Real iPhone .mov files print >2000 chars of stream and
+// metadata detail AFTER the Duration line, so every one of them was
+// rejected as "corrupt". metadata-heavy.mov reproduces that shape (15
+// streams); the probe must parse the FULL output.
+import { spawn } from "node:child_process";
+import { parseFfmpegDuration } from "./probeParsing.ts";
+import { resolveFfmpegPath } from "./ffmpegPaths.ts";
+
+function probeFullStderr(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(resolveFfmpegPath(), ["-i", filePath]);
+    let stderr = "";
+    proc.stderr.on("data", (c) => (stderr += c.toString()));
+    proc.on("error", reject);
+    proc.on("close", () => resolve(stderr));
+  });
+}
+
+test("parseFfmpegDuration handles plain, N/A, and missing durations", () => {
+  assert.equal(parseFfmpegDuration("  Duration: 00:01:02.50, start: 0.0"), 62.5);
+  assert.equal(parseFfmpegDuration("  Duration: 01:00:00.00"), 3600);
+  assert.equal(parseFfmpegDuration("  Duration: N/A, bitrate: N/A"), null);
+  assert.equal(parseFfmpegDuration("no duration here"), null);
+});
+
+test("a metadata-heavy MOV still classifies as video", () => {
+  const heavy = fixture("metadata-heavy.mov");
+  const v = validateEventUpload(heavy, heavy.byteLength);
+  assert.ok(v.ok && v.detected.kind === "video");
+});
+
+test("metadata-heavy MOV: duration parses from FULL probe output but is absent from the old 2000-char tail", async () => {
+  const filePath = path.join(import.meta.dirname, "__fixtures__", "metadata-heavy.mov");
+  const full = await probeFullStderr(filePath);
+  // The fixture must keep encoding the trap, or this test guards nothing.
+  assert.equal(parseFfmpegDuration(full.slice(-2000)), null, "fixture no longer reproduces the truncation trap");
+  const duration = parseFfmpegDuration(full);
+  assert.ok(duration !== null && duration > 0.3 && duration < 2, `parsed ${duration}`);
+});

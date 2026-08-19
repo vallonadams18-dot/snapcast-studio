@@ -36,7 +36,10 @@ export async function saveUploadedFile(eventId: string, file: File) {
       const probePath = path.join(probeDir, `probe.${detected.extension}`);
       await writeFile(probePath, buffer);
       await getVideoDurationSeconds(probePath);
-    } catch {
+    } catch (err) {
+      // The client gets a friendly line; the REAL reason must go to the
+      // server log or the next probe regression is undiagnosable.
+      console.error("[upload] video probe failed", file.name, err);
       throw new Error("That video appears to be corrupt or unreadable — try re-exporting it, then upload again.");
     } finally {
       await rm(probeDir, { recursive: true, force: true }).catch(() => {});
