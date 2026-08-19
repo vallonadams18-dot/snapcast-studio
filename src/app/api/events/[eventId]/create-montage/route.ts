@@ -11,6 +11,7 @@ import {
   getVideoDurationSeconds,
   getVideoFrameRate,
   finalizeForDelivery,
+  extractFrameAt,
 } from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
@@ -26,6 +27,17 @@ import { selectPhotosForMontage, repositionPeak } from "@/lib/photoSelection";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
+// v3: at most this many VIDEO segments per reel. The product is a montage
+// with living moments inside it, not a concatenation of raw clips — and
+// each video segment costs a decode+normalise pass at render time.
+const MAX_VIDEOS = 2;
+
+// Uploaded event videos usually carry no AI scores (caption analysis needs
+// a frame, which uploads don't extract). A real video moment is typically
+// STRONGER than a still of the same moment, so unscored videos enter
+// selection with a solid — not dominant — assumed score instead of a zero
+// that would bury them in the middle of the ranking.
+const ASSUMED_VIDEO_SCORES = { energyScore: 60, visualQualityScore: 55, momentRarityScore: 60 };
 
 export async function POST(request: Request, { params }: { params: Promise<{ eventId: string }> }) {
   const account = await getCurrentAccount();
@@ -53,14 +65,47 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       ? getMontageStyle(body.styleId)
       : suggestStyleForEventType(event.eventType);
 
-  const candidates = await prisma.media.findMany({
-    where: { eventId, accountId: account.id, mediaType: "photo", status: "ready" },
+  // v3: photos AND uploaded videos are both montage inputs. GENERATED media
+  // must never feed back in: a clip (sourceMediaId set) or a previous
+  // montage (compiledFromMediaIds set) as an input would compound renders
+  // into renders.
+  const rawCandidates = await prisma.media.findMany({
+    where: {
+      eventId,
+      accountId: account.id,
+      mediaType: { in: ["photo", "video"] },
+      status: "ready",
+      sourceMediaId: null,
+      compiledFromMediaIds: null,
+    },
     orderBy: { createdAt: "desc" },
     take: 40,
   });
 
+  // Unscored videos get assumed scores (see ASSUMED_VIDEO_SCORES), and only
+  // the strongest MAX_VIDEOS of them stay candidates.
+  const scoredVideos = rawCandidates
+    .filter((m) => m.mediaType === "video")
+    .map((m) =>
+      m.energyScore === null && m.visualQualityScore === null && m.momentRarityScore === null
+        ? { ...m, ...ASSUMED_VIDEO_SCORES }
+        : m,
+    )
+    .sort((a, b) => {
+      const score = (x: typeof a) => (x.energyScore ?? 0) + (x.visualQualityScore ?? 0) + (x.momentRarityScore ?? 0);
+      const diff = score(b) - score(a);
+      return diff !== 0 ? diff : b.createdAt.getTime() - a.createdAt.getTime();
+    });
+  const candidates = [
+    ...rawCandidates.filter((m) => m.mediaType === "photo"),
+    ...scoredVideos.slice(0, MAX_VIDEOS),
+  ];
+
   if (candidates.length < MIN_PHOTOS) {
-    return NextResponse.json({ error: `Need at least ${MIN_PHOTOS} photos to compile a video.` }, { status: 400 });
+    return NextResponse.json(
+      { error: `Need at least ${MIN_PHOTOS} photos or videos to compile a video.` },
+      { status: 400 },
+    );
   }
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), "snapcast-montage-req-"));
@@ -74,7 +119,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       if (cached) return cached;
       let photoPath = photo.storagePath;
       if (photoPath.startsWith("http")) {
-        photoPath = path.join(tmpDir, `photo-${photo.id}.jpg`);
+        // Extension-free on purpose — this can be a photo OR a video, and
+        // ffmpeg identifies inputs by content, not name.
+        photoPath = path.join(tmpDir, `media-${photo.id}`);
         try {
           await writeFile(photoPath, await getMediaBytes(photo));
         } catch {
@@ -109,6 +156,22 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     for (const item of selection.selected) {
       const resolved = await resolvePath(item.candidate);
       if (resolved) pathsByMediaId.set(item.candidate.id, resolved);
+    }
+
+    // v3: probe each selected video's real length so the planner can centre
+    // and bound its trim window. Uploads were probe-checked at intake, so a
+    // failure here means the file changed on disk — drop it rather than
+    // planning a trim that cannot render.
+    const videoDurationsById = new Map<string, number>();
+    for (const item of selection.selected) {
+      if (item.candidate.mediaType !== "video") continue;
+      const p = pathsByMediaId.get(item.candidate.id);
+      if (!p) continue;
+      try {
+        videoDurationsById.set(item.candidate.id, await getVideoDurationSeconds(p));
+      } catch {
+        pathsByMediaId.delete(item.candidate.id);
+      }
     }
 
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
@@ -156,7 +219,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     // Waveform-only — needs no audio download, so the 402 doesn't block it.
     // The window length now comes from the CONCRETE preset's pacing, never
     // the auto placeholder.
-    const estimatedLength = selection.selected.length * style.secondsPerPhoto;
+    // Video segments hold roughly twice a still (see videoSegmentSeconds),
+    // so the energy window estimate counts them double — a rough figure is
+    // fine here, but a systematically short one would analyse the wrong
+    // stretch of the track.
+    const estimatedLength = selection.selected.reduce(
+      (total, s) =>
+        total + (s.candidate.mediaType === "video" ? Math.min(4.5, style.secondsPerPhoto * 2) : style.secondsPerPhoto),
+      0,
+    );
     const energy = await analyzeSectionEnergy({
       waveformUrl: track?.waveformUrl,
       trackLengthSeconds: track?.lengthSeconds,
@@ -181,6 +252,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       selection,
       style,
       pathsByMediaId,
+      videoDurationsById,
       // startSeconds null means "let the high-energy picker choose at mix
       // time" — the behaviour Phase 1 shipped.
       music: {
@@ -284,10 +356,30 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     await probeFps("4-finalDelivered", montageBuffer);
 
     // The opening shot doubles as the representative frame for caption and
-    // score generation — no separate frame extraction needed. It is also the
-    // right choice: the opener is the highest-energy photo, so the caption is
-    // written about the moment the video actually leads with.
-    const representativeFrame = await getMediaBytes(selected[0]);
+    // score generation. It is also the right choice: the opener is the
+    // highest-energy shot, so the caption is written about the moment the
+    // video actually leads with. v3: when the opener is a VIDEO, a real
+    // frame is extracted from inside its trim window — raw video bytes are
+    // not an image the caption model can look at.
+    let representativeFrame: Buffer;
+    if (selected[0].mediaType === "video" && pathsByMediaId.has(selected[0].id)) {
+      const framePath = path.join(tmpDir, "representative.jpg");
+      const openerSegment = plan.segments.find((s) => s.mediaId === selected[0].id);
+      try {
+        await extractFrameAt(
+          pathsByMediaId.get(selected[0].id)!,
+          (openerSegment?.sourceStartSeconds ?? 0) + Math.min(0.5, (openerSegment?.durationSeconds ?? 1) / 2),
+          framePath,
+        );
+        representativeFrame = await readFile(framePath);
+      } catch {
+        // A failed frame grab must not cost the render — raw bytes make the
+        // caption model fall back to placeholder text, which is survivable.
+        representativeFrame = await getMediaBytes(selected[0]);
+      }
+    } else {
+      representativeFrame = await getMediaBytes(selected[0]);
+    }
     const analysis = await analyzeClip(selected[0], event, account, representativeFrame);
     await logUsageEvent(account.id, "montage");
 

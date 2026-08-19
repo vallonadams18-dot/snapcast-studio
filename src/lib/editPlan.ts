@@ -10,6 +10,9 @@
 // renderer stays judgment-free — and any variety is chosen with a seed
 // derived from the photo set, so re-planning the same event reproduces the
 // identical plan while different events differ.
+// Imports are RELATIVE (not "@/lib/…") on purpose: this module and
+// montageStyles are dependency-free, which lets editPlan.test.ts run them
+// under plain `node --test` without a bundler resolving the alias.
 import {
   photoDurations,
   maxTransitionSeconds,
@@ -17,16 +20,28 @@ import {
   type MotionKind,
   type MotionEasing,
   type RoleTreatment,
-} from "@/lib/montageStyles";
-import type { NarrativeRole, SelectedPhoto, SelectionCandidate, SelectionResult } from "@/lib/photoSelection";
+} from "./montageStyles.ts";
+import type { NarrativeRole, SelectedPhoto, SelectionCandidate, SelectionResult } from "./photoSelection.ts";
 
 export type SegmentMotion = MotionKind;
 export type SegmentFit = MontageStyle["fit"];
+export type SegmentMediaKind = "photo" | "video";
 
 export interface EditSegment {
   mediaId: string;
   /** Readable local path for the renderer. Never logged. */
   sourcePath: string;
+  /**
+   * v3: what this segment IS. A photo is animated by the preset's camera
+   * language; a video plays its own motion and gets none synthesised on
+   * top. Explicit — a video is never disguised as a photo segment.
+   */
+  mediaKind: SegmentMediaKind;
+  /**
+   * v3: where playback starts inside the SOURCE file, seconds. Always 0 for
+   * photos. durationSeconds is the trim length for videos.
+   */
+  sourceStartSeconds: number;
   role: NarrativeRole;
   durationSeconds: number;
 
@@ -79,7 +94,7 @@ export interface EditPlanMusic {
 }
 
 export interface EditPlan {
-  planVersion: 2;
+  planVersion: 3;
   presetId: string;
   presetName: string;
   /** One grade for the entire video — uniformity is the art direction. */
@@ -204,6 +219,51 @@ function snapDurationsToBeats(
   return snapped.map((d) => Math.round(Math.max(floor, d) * 1000) / 1000);
 }
 
+// ------------------------------------------------------- video trim policy --
+// Uploaded videos hold longer than stills — they carry their own motion —
+// but never long enough to swallow the reel. Deterministic; no AI involved.
+const VIDEO_MIN_SECONDS = 2;
+const VIDEO_MAX_SECONDS = 4.5;
+
+/**
+ * How long a VIDEO segment plays. Starts from double the style's still
+ * length (a moving shot earns more screen time than a photo in the same
+ * preset), clamps to [2s, 4.5s], then — when the track's tempo is known —
+ * lands on a whole number of beats like every photo segment does. Finally
+ * bounded by the source itself: a 1.8s clip plays for 1.8s.
+ */
+export function videoSegmentSeconds(
+  styleSeconds: number,
+  beatIntervalSeconds: number | null,
+  sourceDurationSeconds: number | null,
+): number {
+  let target = Math.min(VIDEO_MAX_SECONDS, Math.max(VIDEO_MIN_SECONDS, styleSeconds * 2));
+  if (beatIntervalSeconds && beatIntervalSeconds > 0) {
+    let multiple = Math.max(1, Math.round(target / beatIntervalSeconds));
+    while (multiple > 1 && multiple * beatIntervalSeconds > VIDEO_MAX_SECONDS) multiple -= 1;
+    const snapped = multiple * beatIntervalSeconds;
+    if (snapped >= VIDEO_MIN_SECONDS * 0.75 && snapped <= VIDEO_MAX_SECONDS) target = snapped;
+  }
+  if (sourceDurationSeconds !== null && sourceDurationSeconds > 0) {
+    target = Math.min(target, Math.max(1, sourceDurationSeconds));
+  }
+  return Math.round(target * 1000) / 1000;
+}
+
+/**
+ * Where the trim starts inside the source. Centred slightly BEFORE the
+ * middle (40%) — phone event videos usually put the action early-middle and
+ * the fumbled camera-raise at the very start. Clamped so the window always
+ * fits inside the source. AI highlight detection (create-clip has it) is a
+ * later upgrade; this is deterministic and free.
+ */
+export function videoTrimStartSeconds(sourceDurationSeconds: number | null, playSeconds: number): number {
+  if (sourceDurationSeconds === null || sourceDurationSeconds <= playSeconds) return 0;
+  const centred = sourceDurationSeconds * 0.4 - playSeconds / 2;
+  const clamped = Math.min(Math.max(0, centred), sourceDurationSeconds - playSeconds);
+  return Math.round(clamped * 100) / 100;
+}
+
 // --------------------------------------------------------------- authoring --
 /** Treatment for one segment, resolved from role + vocabulary + seed. */
 function treatmentFor(
@@ -232,16 +292,24 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
   /** Local path per media id, from the caller's storage resolution. */
   pathsByMediaId: Map<string, string>;
   music: EditPlanMusic | null;
+  /**
+   * v3: probed source length per VIDEO media id. A video absent from this
+   * map still plans (trim starts at 0), but with it the trim window can be
+   * centred and bounded properly.
+   */
+  videoDurationsById?: Map<string, number>;
 }): EditPlan {
-  const { selection, style, pathsByMediaId, music } = options;
+  const { selection, style, pathsByMediaId, music, videoDurationsById } = options;
 
   const usable: SelectedPhoto<T>[] = selection.selected.filter((s) => pathsByMediaId.has(s.candidate.id));
+  const kindOf = (item: SelectedPhoto<T>): SegmentMediaKind =>
+    item.candidate.mediaType === "video" ? "video" : "photo";
 
   // Style intent first, then music rhythm refines it; unknown BPM keeps the
   // profile exactly as authored. Enhancement, never a render dependency.
   const styleDurations = photoDurations(usable.length, style);
   const beatInterval = music?.beatIntervalSeconds ?? null;
-  const durations =
+  const snapped =
     beatInterval && beatInterval > 0
       ? snapDurationsToBeats(
           styleDurations,
@@ -251,23 +319,54 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
         )
       : styleDurations;
 
+  // v3: video segments override the still-photo profile with their own
+  // policy — longer holds, beat-aligned, bounded by the source. Photos keep
+  // the snapped profile untouched, so a pure-photo plan is byte-identical
+  // to v2.
+  const durations = snapped.map((d, i) => {
+    const item = usable[i];
+    if (kindOf(item) !== "video") return d;
+    const src = videoDurationsById?.get(item.candidate.id) ?? null;
+    return videoSegmentSeconds(style.secondsPerPhoto, beatInterval, src);
+  });
+
+  // Hero hold must survive a video hero too: the closing shot out-holds the
+  // opener and the peak, bounded by the source and the video ceiling.
+  const lastIdx = usable.length - 1;
+  if (lastIdx > 0 && usable[lastIdx].role === "hero" && kindOf(usable[lastIdx]) === "video") {
+    const peakIdx = usable.findIndex((u) => u.role === "peak");
+    const mustBeat = Math.max(durations[0], peakIdx >= 0 ? durations[peakIdx] : 0);
+    const src = videoDurationsById?.get(usable[lastIdx].candidate.id) ?? null;
+    const ceiling = Math.min(4.5, src ?? 4.5);
+    if (durations[lastIdx] <= mustBeat && ceiling > mustBeat) {
+      durations[lastIdx] = Math.round(Math.min(ceiling, mustBeat + (beatInterval ?? 0.5)) * 1000) / 1000;
+    }
+  }
+
   const seed = seedFromIds(usable.map((u) => u.candidate.id));
   const vocabOffset = seed % Math.max(1, style.motionVocabulary.length);
 
   let middleIndex = 0;
   const segments: EditSegment[] = usable.map((item, index) => {
     const role = item.role;
+    const mediaKind = kindOf(item);
     const treatment = treatmentFor(style, role, role === "build" || role === "variety" ? middleIndex++ : 0, vocabOffset);
+    const src = mediaKind === "video" ? (videoDurationsById?.get(item.candidate.id) ?? null) : null;
     return {
       mediaId: item.candidate.id,
       sourcePath: pathsByMediaId.get(item.candidate.id)!,
+      mediaKind,
+      sourceStartSeconds: mediaKind === "video" ? videoTrimStartSeconds(src, durations[index]) : 0,
       role,
       durationSeconds: durations[index],
-      motion: treatment.motion,
-      motionMagnitude: treatment.magnitude,
+      // A video carries its OWN motion — synthesising camera moves on top
+      // reads as jelly. It still gets the preset's fit, grade, transitions,
+      // and accent treatment, so it sits inside the same visual language.
+      motion: mediaKind === "video" ? "none" : treatment.motion,
+      motionMagnitude: mediaKind === "video" ? 0 : treatment.magnitude,
       easing: treatment.easing,
-      bgMagnitude: style.fit === "blurred" ? style.bgMagnitude : 0,
-      rotateDriftDegrees: style.rotateDriftDegrees,
+      bgMagnitude: mediaKind === "video" ? 0 : style.fit === "blurred" ? style.bgMagnitude : 0,
+      rotateDriftDegrees: mediaKind === "video" ? 0 : style.rotateDriftDegrees,
       fit: style.fit,
       transitionOut: style.baseTransition.kind,
       transitionSeconds: style.baseTransition.seconds,
@@ -327,7 +426,7 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
   }
 
   return {
-    planVersion: 2,
+    planVersion: 3,
     presetId: style.id,
     presetName: style.name,
     look: style.look,
@@ -364,8 +463,14 @@ export function isAllHardCuts(segments: EditSegment[]): boolean {
  * answering "why does the edit look like this", not for exposing disk.
  */
 export function describeEditPlan(plan: EditPlan): string {
+  const photoCount = plan.segments.filter((s) => s.mediaKind === "photo").length;
+  const videoCount = plan.segments.length - photoCount;
   const header =
-    `[plan v${plan.planVersion}] preset=${plan.presetName} · ${plan.segments.length} segments · ` +
+    `[plan v${plan.planVersion}] preset=${plan.presetName} · ${plan.segments.length} segments` +
+    (videoCount > 0
+      ? ` (${photoCount} photo${photoCount === 1 ? "" : "s"} + ${videoCount} video${videoCount === 1 ? "" : "s"})`
+      : "") +
+    ` · ` +
     `~${plan.targetDurationSeconds.toFixed(1)}s · look sat=${plan.look.saturation} con=${plan.look.contrast} ` +
     `vig=${plan.look.vignette} grain=${plan.look.grain} · ${plan.duplicatesFound} near-duplicates skipped` +
     (plan.music
@@ -377,11 +482,13 @@ export function describeEditPlan(plan: EditPlan): string {
 
   const rows = plan.segments.map((s, i) => {
     const move =
-      s.motion === "none"
-        ? "still"
-        : `${s.motion} ${Math.round(s.motionMagnitude * 100)}%/${s.easing}` +
-          (s.bgMagnitude > 0 ? ` bg${Math.round(s.bgMagnitude * 100)}%` : "") +
-          (s.rotateDriftDegrees > 0 ? ` rot${s.rotateDriftDegrees}°` : "");
+      s.mediaKind === "video"
+        ? `live video from ${s.sourceStartSeconds.toFixed(1)}s`
+        : s.motion === "none"
+          ? "still"
+          : `${s.motion} ${Math.round(s.motionMagnitude * 100)}%/${s.easing}` +
+            (s.bgMagnitude > 0 ? ` bg${Math.round(s.bgMagnitude * 100)}%` : "") +
+            (s.rotateDriftDegrees > 0 ? ` rot${s.rotateDriftDegrees}°` : "");
     const join =
       i === plan.segments.length - 1
         ? "end"

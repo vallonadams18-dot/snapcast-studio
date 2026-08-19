@@ -18,6 +18,8 @@ export interface SelectionCandidate {
   id: string;
   storagePath: string;
   createdAt: Date;
+  /** "photo" | "video" — Media.mediaType. Drives EditPlan v3's mediaKind. */
+  mediaType: string;
   energyScore: number | null;
   visualQualityScore: number | null;
   momentRarityScore: number | null;
@@ -195,7 +197,12 @@ export async function selectPhotosForMontage<T extends SelectionCandidate>(
   const ranked = await Promise.all(
     hashPool.map(async (candidate) => {
       const path = await resolvePath(candidate);
-      return { candidate, hash: path ? await computeDHash(path) : null };
+      // Videos never enter duplicate detection: dHash is a STILL-image
+      // measure, and a null hash means "never matches anything, always
+      // kept" — the same rule that protects unhashable photos. Resolving
+      // the path anyway warms the cache the renderer reads later.
+      const hash = path && candidate.mediaType !== "video" ? await computeDHash(path) : null;
+      return { candidate, hash };
     }),
   );
 

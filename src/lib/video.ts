@@ -68,7 +68,7 @@ export async function getVideoFrameRate(filePath: string): Promise<number | null
   return match ? Number(match[1]) : null;
 }
 
-async function extractFrameAt(filePath: string, atSeconds: number, outputPath: string): Promise<void> {
+export async function extractFrameAt(filePath: string, atSeconds: number, outputPath: string): Promise<void> {
   await runFfmpeg([
     "-ss", String(Math.max(0, atSeconds)),
     "-i", filePath,
@@ -555,6 +555,54 @@ async function createPhotoSegment(segment: EditSegment, plan: EditPlan, outputPa
   throw lastError;
 }
 
+// One VIDEO → one vertical segment (EditPlan v3). The plan has already
+// decided the trim window; this normalises the clip to the montage geometry
+// so it concatenates seamlessly with photo segments: blurred-fit into
+// 1080x1920 (portrait, landscape, square all safe), the plan's grade, 30fps
+// CFR, yuv420p, SAR 1. No synthesised camera motion — the clip's own motion
+// IS the motion. Audio is stripped: montage segments are silent by
+// contract; the licensed track owns the final audio bed (see lib/branding
+// for the same decision on bookends).
+async function createVideoSegment(segment: EditSegment, plan: EditPlan, outputPath: string): Promise<void> {
+  const grade = gradeChain(plan.look);
+  // setsar=1 matters here in a way it doesn't for photos: camera files can
+  // carry non-square sample aspect ratios, and xfade refuses inputs whose
+  // SARs disagree.
+  const fitChain = `${BLURRED_FIT_FILTER},setsar=1`;
+
+  const inputArgs = [
+    // -ss before -i: input seeking, frame-accurate under re-encode.
+    "-ss", String(segment.sourceStartSeconds),
+    "-i", segment.sourcePath,
+    "-t", String(segment.durationSeconds),
+  ];
+  const outputArgs = [
+    "-an",
+    "-r", String(VIDEO_FPS),
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    ...intermediateEncode(),
+    "-y", outputPath,
+  ];
+
+  // Grade is cosmetic — never let it cost the segment.
+  const attempts: string[][] = [
+    ["-filter_complex", `${fitChain},${grade}`],
+    ["-filter_complex", fitChain],
+  ];
+
+  let lastError: unknown;
+  for (const filterArgs of attempts) {
+    try {
+      await runFfmpeg([...inputArgs, ...filterArgs, ...outputArgs]);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
 // Cross-fades between segments using xfade, which needs ffmpeg 4.3+.
 // Returns false when unavailable (or when the graph fails) so the caller
 // can fall back to hard cuts instead of producing nothing.
@@ -635,7 +683,11 @@ export async function createPhotoMontage(options: PhotoMontageOptions): Promise<
     const segmentPaths: string[] = [];
     for (const [i, segment] of segments.entries()) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
-      await createPhotoSegment(segment, options.plan, segPath);
+      if (segment.mediaKind === "video") {
+        await createVideoSegment(segment, options.plan, segPath);
+      } else {
+        await createPhotoSegment(segment, options.plan, segPath);
+      }
       segmentPaths.push(segPath);
     }
 
