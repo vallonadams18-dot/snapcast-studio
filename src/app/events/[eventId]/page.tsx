@@ -56,6 +56,13 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
       m.sourceMediaId === null &&
       m.compiledFromMediaIds === null,
   ).length;
+  const readyVideoCount = event.media.filter(
+    (m) =>
+      m.status === "ready" &&
+      m.mediaType === "video" &&
+      m.sourceMediaId === null &&
+      m.compiledFromMediaIds === null,
+  ).length;
 
   const headerList = await headers();
   const origin = `${headerList.get("x-forwarded-proto") ?? "http"}://${headerList.get("host")}`;
@@ -77,6 +84,7 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
       <PhotoMontageButton
         eventId={event.id}
         readySourceCount={readySourceCount}
+        readyVideoCount={readyVideoCount}
         suggestedStyleId={suggestStyleForEventType(event.eventType).id}
       />
 

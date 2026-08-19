@@ -12,6 +12,7 @@ import {
   getVideoFrameRate,
   finalizeForDelivery,
   extractFrameAt,
+  detectVideoSceneWindows,
 } from "@/lib/video";
 import { buildEditPlan, describeEditPlan, planDurationSeconds } from "@/lib/editPlan";
 import { mixTrackIntoClip, resolveTrackForCategory } from "@/lib/music";
@@ -24,6 +25,7 @@ import { logUsageEvent } from "@/lib/usage";
 import { isFeatureEnabled } from "@/lib/featureFlags";
 import { addBrandBookends, applyWatermark } from "@/lib/branding";
 import { selectPhotosForMontage, repositionPeak } from "@/lib/photoSelection";
+import { expandSelectionForTemplate, getSocialTemplate } from "@/lib/socialTemplates";
 
 const MAX_PHOTOS = 8;
 const MIN_PHOTOS = 2;
@@ -57,11 +59,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
 
   // Body is optional — an omitted/!json body just means "pick for me".
   const body = await request.json().catch(() => ({}) as Record<string, unknown>);
+  const template = getSocialTemplate(body.templateId);
   // What the client ASKED for. "auto" is resolved to a concrete preset only
   // after the track and energy analysis exist, because that is what it
   // chooses from — see below.
-  const requestedStyle =
-    typeof body.styleId === "string"
+  const requestedStyle = template
+    ? getMontageStyle(template.basePresetId)
+    : typeof body.styleId === "string"
       ? getMontageStyle(body.styleId)
       : suggestStyleForEventType(event.eventType);
 
@@ -101,9 +105,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     ...scoredVideos.slice(0, MAX_VIDEOS),
   ];
 
-  if (candidates.length < MIN_PHOTOS) {
+  const singleVideoCanFillTemplate = Boolean(
+    template?.allowsSingleVideo && candidates.some((candidate) => candidate.mediaType === "video"),
+  );
+  const minimumSources = template?.minSourceAssets ?? MIN_PHOTOS;
+  if (candidates.length < minimumSources && !singleVideoCanFillTemplate) {
     return NextResponse.json(
-      { error: `Need at least ${MIN_PHOTOS} photos or videos to compile a video.` },
+      { error: `Need at least ${minimumSources} photos or videos to compile this video.` },
       { status: 400 },
     );
   }
@@ -139,12 +147,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     // alike, because scoring never compared one photo to another — and it
     // ordered them best-to-worst, so the weakest image was always the one
     // left on screen at the end, which is what a looping video rests on.
-    let selection = await selectPhotosForMontage(candidates, MAX_PHOTOS, resolvePath);
-    const selected = selection.selected.map((s) => s.candidate);
+    let selection = await selectPhotosForMontage(candidates, template?.maxSourceAssets ?? MAX_PHOTOS, resolvePath);
+    let selected = selection.selected.map((s) => s.candidate);
 
-    if (selected.length < MIN_PHOTOS) {
+    if (selected.length < minimumSources && !(singleVideoCanFillTemplate && selected.some((m) => m.mediaType === "video"))) {
       return NextResponse.json(
-        { error: `Need at least ${MIN_PHOTOS} distinct photos to compile a video.` },
+        { error: `Need at least ${minimumSources} distinct photos or videos to compile this video.` },
         { status: 400 },
       );
     }
@@ -169,9 +177,35 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
       if (!p) continue;
       try {
         videoDurationsById.set(item.candidate.id, await getVideoDurationSeconds(p));
-      } catch {
+      } catch (err) {
+        console.error(`[template] duration probe failed for media ${item.candidate.id}`, err);
         pathsByMediaId.delete(item.candidate.id);
       }
+    }
+
+    // A real template owns a SLOT structure. One uploaded video can supply
+    // several distinct moments instead of returning as one mostly unchanged
+    // centre slice. The original Media row remains the source for every slot.
+    if (template) {
+      const scenesByMediaId = new Map<string, Awaited<ReturnType<typeof detectVideoSceneWindows>>>();
+      for (const item of selection.selected) {
+        if (item.candidate.mediaType !== "video") continue;
+        const mediaPath = pathsByMediaId.get(item.candidate.id);
+        const duration = videoDurationsById.get(item.candidate.id);
+        if (!mediaPath || !duration) continue;
+        const scenes = await detectVideoSceneWindows(
+          mediaPath,
+          duration,
+          template.maxScenesPerVideo,
+          template.videoSceneSeconds,
+        );
+        scenesByMediaId.set(item.candidate.id, scenes);
+      }
+      selection = expandSelectionForTemplate(selection, template, scenesByMediaId);
+      selected = selection.selected.map((item) => item.candidate);
+      console.log(
+        `[template] ${template.name} expanded ${new Set(selected.map((media) => media.id)).size} source assets into ${selected.length} edit slots`,
+      );
     }
 
     const suggestedTrack = suggestTrackForEventType(event.eventType).id;
@@ -422,7 +456,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ eve
     return NextResponse.json({
       montage,
       photoCount: selected.length,
-      style: style.name,
+      style: template?.name ?? style.name,
+      template: template?.id ?? null,
       duplicatesSkipped: selection.duplicatesFound,
       // Non-fatal. The video is finished and usable either way; this only
       // says whether it has a soundtrack, so the client is told rather than

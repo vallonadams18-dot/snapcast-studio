@@ -7,6 +7,7 @@ import { resolveFfmpegPath, resolveFontFile } from "@/lib/ffmpegPaths";
 import { VIDEO_FPS, intermediateEncode, deliveryEncode } from "@/lib/encoding";
 import { parseFfmpegDuration } from "@/lib/probeParsing";
 import { isAllHardCuts, type EditPlan, type EditSegment, type SegmentMotion } from "@/lib/editPlan";
+import { parseSceneChangeTimes, planVideoSceneWindows, type VideoSceneWindow } from "@/lib/videoScenePlanning";
 
 // ffmpeg's filtergraph mini-language treats `:`, `\`, and unescaped `'` as
 // syntax, so any path fed into a filter option (fontfile=, textfile=) needs
@@ -86,6 +87,33 @@ export async function extractFrameAt(filePath: string, atSeconds: number, output
     "-q:v", "3",
     "-y", outputPath,
   ]);
+}
+
+/**
+ * Detect hard visual cuts, then turn them into several distinct short-form
+ * windows. Scene detection is advisory: an older ffmpeg build or a single
+ * continuous phone take falls back to evenly spaced windows, so the template
+ * still transforms the source instead of returning one long central slice.
+ */
+export async function detectVideoSceneWindows(
+  filePath: string,
+  durationSeconds: number,
+  desiredCount: number,
+  windowSeconds: number,
+): Promise<VideoSceneWindow[]> {
+  let output = "";
+  try {
+    output = await runFfmpeg([
+      "-i", filePath,
+      "-vf", "select='gt(scene,0.28)',showinfo",
+      "-an",
+      "-f", "null",
+      "-",
+    ]);
+  } catch {
+    // The deterministic spacing fallback below is deliberately sufficient.
+  }
+  return planVideoSceneWindows(durationSeconds, parseSceneChangeTimes(output), desiredCount, windowSeconds);
 }
 
 export interface HighlightWindow {

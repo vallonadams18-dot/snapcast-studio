@@ -325,8 +325,12 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
   // to v2.
   const durations = snapped.map((d, i) => {
     const item = usable[i];
-    if (kindOf(item) !== "video") return d;
+    if (kindOf(item) !== "video") return item.durationSeconds ?? d;
     const src = videoDurationsById?.get(item.candidate.id) ?? null;
+    if (item.durationSeconds !== undefined && item.durationSeconds > 0) {
+      const remaining = src === null ? item.durationSeconds : Math.max(1, src - (item.sourceStartSeconds ?? 0));
+      return Math.round(Math.min(item.durationSeconds, remaining) * 1000) / 1000;
+    }
     return videoSegmentSeconds(style.secondsPerPhoto, beatInterval, src);
   });
 
@@ -337,7 +341,8 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
     const peakIdx = usable.findIndex((u) => u.role === "peak");
     const mustBeat = Math.max(durations[0], peakIdx >= 0 ? durations[peakIdx] : 0);
     const src = videoDurationsById?.get(usable[lastIdx].candidate.id) ?? null;
-    const ceiling = Math.min(4.5, src ?? 4.5);
+    const remaining = src === null ? 4.5 : Math.max(1, src - (usable[lastIdx].sourceStartSeconds ?? 0));
+    const ceiling = Math.min(4.5, remaining);
     if (durations[lastIdx] <= mustBeat && ceiling > mustBeat) {
       durations[lastIdx] = Math.round(Math.min(ceiling, mustBeat + (beatInterval ?? 0.5)) * 1000) / 1000;
     }
@@ -356,7 +361,10 @@ export function buildEditPlan<T extends SelectionCandidate>(options: {
       mediaId: item.candidate.id,
       sourcePath: pathsByMediaId.get(item.candidate.id)!,
       mediaKind,
-      sourceStartSeconds: mediaKind === "video" ? videoTrimStartSeconds(src, durations[index]) : 0,
+      sourceStartSeconds:
+        mediaKind === "video"
+          ? (item.sourceStartSeconds ?? videoTrimStartSeconds(src, durations[index]))
+          : 0,
       role,
       durationSeconds: durations[index],
       // A video carries its OWN motion — synthesising camera moves on top

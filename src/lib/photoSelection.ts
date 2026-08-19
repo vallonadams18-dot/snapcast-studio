@@ -30,6 +30,10 @@ export interface SelectedPhoto<T extends SelectionCandidate = SelectionCandidate
   role: NarrativeRole;
   /** Plain-language explanation. Debuggable now, user-facing later. */
   reason: string;
+  /** Optional template-selected window when the candidate is a video. */
+  sourceStartSeconds?: number;
+  /** Optional exact template slot length when the candidate is a video. */
+  durationSeconds?: number;
 }
 
 export interface SelectionResult<T extends SelectionCandidate = SelectionCandidate> {

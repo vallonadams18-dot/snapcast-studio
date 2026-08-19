@@ -5,14 +5,17 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui";
 import { ErrorState, SuccessBanner } from "@/components/States";
 import { MONTAGE_STYLES } from "@/lib/montageStyles";
+import { EVENT_IN_20_TEMPLATE } from "@/lib/socialTemplates";
 
 export function PhotoMontageButton({
   eventId,
   readySourceCount,
+  readyVideoCount,
   suggestedStyleId,
 }: {
   eventId: string;
   readySourceCount: number;
+  readyVideoCount: number;
   suggestedStyleId: string;
 }) {
   const router = useRouter();
@@ -22,6 +25,7 @@ export function PhotoMontageButton({
   // Non-fatal advisory: the render succeeded but has no soundtrack.
   const [notice, setNotice] = useState<string | null>(null);
   const [styleId, setStyleId] = useState(suggestedStyleId);
+  const [templateId, setTemplateId] = useState<string | null>(EVENT_IN_20_TEMPLATE.id);
 
   async function generate() {
     setStatus("working");
@@ -32,7 +36,7 @@ export function PhotoMontageButton({
       const response = await fetch(`/api/events/${eventId}/create-montage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ styleId }),
+        body: JSON.stringify(templateId ? { templateId } : { styleId }),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error ?? "Couldn't create the video.");
@@ -59,7 +63,8 @@ export function PhotoMontageButton({
   }
 
   const working = status === "working";
-  const canGenerate = readySourceCount >= 2;
+  const templateEligible = readySourceCount >= 2 || readyVideoCount > 0;
+  const canGenerate = templateId === EVENT_IN_20_TEMPLATE.id ? templateEligible : readySourceCount >= 2;
   const sourcesNeeded = Math.max(0, 2 - readySourceCount);
 
   return (
@@ -72,16 +77,42 @@ export function PhotoMontageButton({
       </p>
 
       <div className="mt-3">
-        <p className="mb-2 text-xs font-medium text-foreground">Pick a style</p>
+        <p className="mb-2 text-xs font-medium text-foreground">Featured template</p>
+        <button
+          type="button"
+          onClick={() => setTemplateId(EVENT_IN_20_TEMPLATE.id)}
+          disabled={working || !templateEligible}
+          className={`tap-scale min-h-11 w-full rounded-xl border p-3 text-left disabled:opacity-60 ${
+            templateId === EVENT_IN_20_TEMPLATE.id
+              ? "border-primary-pink bg-gradient-to-r from-primary-purple/10 to-primary-pink/10"
+              : "border-border bg-background hover:border-primary-pink/50"
+          }`}
+        >
+          <span className="flex items-center justify-between gap-2 text-sm font-semibold text-foreground">
+            {EVENT_IN_20_TEMPLATE.name}
+            <span className="rounded-full bg-primary-pink/15 px-2 py-1 text-[10px] font-medium text-primary-pink">NEW</span>
+          </span>
+          <span className="mt-1 block text-xs leading-relaxed text-neutral-500">
+            {EVENT_IN_20_TEMPLATE.description} A long upload can supply several different scenes.
+          </span>
+          <span className="mt-2 block text-[10px] font-medium text-primary-pink">About 20 seconds · photos + video</span>
+        </button>
+      </div>
+
+      <div className="mt-3">
+        <p className="mb-2 text-xs font-medium text-foreground">Or pick a visual style</p>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {MONTAGE_STYLES.map((s) => (
             <button
               key={s.id}
               type="button"
-              onClick={() => setStyleId(s.id)}
-              disabled={working || !canGenerate}
+              onClick={() => {
+                setTemplateId(null);
+                setStyleId(s.id);
+              }}
+              disabled={working || readySourceCount < 2}
               className={`tap-scale min-h-11 rounded-lg border px-3 py-2 text-left disabled:opacity-60 ${
-                styleId === s.id
+                templateId === null && styleId === s.id
                   ? "border-primary-pink bg-primary-pink/10"
                   : "border-border bg-background hover:border-primary-pink/50"
               }`}
@@ -102,7 +133,9 @@ export function PhotoMontageButton({
         {working
           ? "Compiling video… (this takes a minute)"
           : canGenerate
-            ? "Create video"
+            ? templateId
+              ? `Use ${EVENT_IN_20_TEMPLATE.name}`
+              : "Create video"
             : `Add ${sourcesNeeded} more to create`}
       </Button>
 
