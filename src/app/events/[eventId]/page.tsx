@@ -47,7 +47,15 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
   const approvedCount = await prisma.draft.count({
     where: { eventId, status: { in: ["approved", "edited"] } },
   });
-  const readyPhotoCount = event.media.filter((m) => m.mediaType === "photo" && m.status === "ready").length;
+  // The mixed-media renderer accepts raw photos and uploaded videos. Keep
+  // generated clips/montages out so renders never feed back into themselves.
+  const readySourceCount = event.media.filter(
+    (m) =>
+      m.status === "ready" &&
+      (m.mediaType === "photo" || m.mediaType === "video") &&
+      m.sourceMediaId === null &&
+      m.compiledFromMediaIds === null,
+  ).length;
 
   const headerList = await headers();
   const origin = `${headerList.get("x-forwarded-proto") ?? "http"}://${headerList.get("host")}`;
@@ -68,7 +76,7 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
 
       <PhotoMontageButton
         eventId={event.id}
-        readyPhotoCount={readyPhotoCount}
+        readySourceCount={readySourceCount}
         suggestedStyleId={suggestStyleForEventType(event.eventType).id}
       />
 
@@ -106,4 +114,3 @@ export default async function EventPage({ params }: { params: Promise<{ eventId:
     </div>
   );
 }
-

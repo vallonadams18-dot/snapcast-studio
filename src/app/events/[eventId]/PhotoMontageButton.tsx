@@ -8,11 +8,11 @@ import { MONTAGE_STYLES } from "@/lib/montageStyles";
 
 export function PhotoMontageButton({
   eventId,
-  readyPhotoCount,
+  readySourceCount,
   suggestedStyleId,
 }: {
   eventId: string;
-  readyPhotoCount: number;
+  readySourceCount: number;
   suggestedStyleId: string;
 }) {
   const router = useRouter();
@@ -22,8 +22,6 @@ export function PhotoMontageButton({
   // Non-fatal advisory: the render succeeded but has no soundtrack.
   const [notice, setNotice] = useState<string | null>(null);
   const [styleId, setStyleId] = useState(suggestedStyleId);
-
-  if (readyPhotoCount < 2) return null;
 
   async function generate() {
     setStatus("working");
@@ -61,13 +59,16 @@ export function PhotoMontageButton({
   }
 
   const working = status === "working";
+  const canGenerate = readySourceCount >= 2;
+  const sourcesNeeded = Math.max(0, 2 - readySourceCount);
 
   return (
     <div className="mt-4 rounded-xl border border-border bg-surface p-4">
-      <p className="text-sm font-medium text-foreground">Create video from photos</p>
+      <p className="text-sm font-medium text-foreground">Create a social video</p>
       <p className="mt-1 text-xs text-neutral-500">
-        Compiles your best {Math.min(readyPhotoCount, 8)} photos into a vertical video with music — like an
-        Instagram or TikTok photo slideshow.
+        {canGenerate
+          ? `Snapcast will turn your best ${Math.min(readySourceCount, 8)} photos and video moments into a vertical social video.`
+          : `Add ${sourcesNeeded} more photo or video${sourcesNeeded === 1 ? "" : "s"} to create your first social video.`}
       </p>
 
       <div className="mt-3">
@@ -78,7 +79,7 @@ export function PhotoMontageButton({
               key={s.id}
               type="button"
               onClick={() => setStyleId(s.id)}
-              disabled={working}
+              disabled={working || !canGenerate}
               className={`tap-scale min-h-11 rounded-lg border px-3 py-2 text-left disabled:opacity-60 ${
                 styleId === s.id
                   ? "border-primary-pink bg-primary-pink/10"
@@ -97,8 +98,12 @@ export function PhotoMontageButton({
         </div>
       </div>
 
-      <Button onClick={generate} disabled={working} className="mt-3 min-h-11 w-full">
-        {working ? "Compiling video… (this takes a minute)" : "Create video"}
+      <Button onClick={generate} disabled={working || !canGenerate} className="mt-3 min-h-11 w-full">
+        {working
+          ? "Compiling video… (this takes a minute)"
+          : canGenerate
+            ? "Create video"
+            : `Add ${sourcesNeeded} more to create`}
       </Button>
 
       {error && (
