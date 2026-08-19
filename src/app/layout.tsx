@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import { getCurrentSession } from "@/lib/auth";
 import { ImpersonationBanner } from "./ImpersonationBanner";
+import { UploadStatusBar } from "./UploadStatusBar";
 import "./globals.css";
 
 const inter = Inter({
@@ -22,6 +23,7 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
       <body className="min-h-full flex flex-col">
         {session?.impersonatedByAccountId && <ImpersonationBanner clientName={session.account.businessName} />}
         {children}
+        <UploadStatusBar />
       </body>
     </html>
   );
