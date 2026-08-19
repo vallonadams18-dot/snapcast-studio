@@ -51,6 +51,38 @@ export function UploadForm({ eventId }: { eventId: string }) {
     });
   }
 
+  // Phone photos arrive at 10-20MB but the reel renders at 1080x1920, so
+  // most of those bytes never reach the screen. Downscale JPEGs to the
+  // render resolution ON the phone before upload — visually identical in
+  // the video, several times faster on a cell connection. Anything that
+  // can't be processed (odd format, decode failure, result not smaller)
+  // falls back to the original file; the server re-validates real bytes
+  // either way. Videos are deliberately left alone: re-encoding video in
+  // the browser is slower than uploading it.
+  const COMPRESS_OVER_BYTES = 3 * 1024 * 1024;
+  const MAX_EDGE = 2160; // 2x the 1080-wide render frame — no visible loss
+  async function compressPhoto(file: File): Promise<File> {
+    if (!file.type.startsWith("image/jpeg") || file.size <= COMPRESS_OVER_BYTES) return file;
+    try {
+      const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+      const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+      const w = Math.round(bitmap.width * scale);
+      const h = Math.round(bitmap.height * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return file;
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", 0.85));
+      if (!blob || blob.size >= file.size) return file;
+      return new File([blob], file.name.replace(/\.[^.]*$/, "") + ".jpg", { type: "image/jpeg" });
+    } catch {
+      return file;
+    }
+  }
+
   // Files upload ONE PER REQUEST, sequentially. A whole camera-roll
   // selection in a single request used to blow through the server's
   // per-request body cap and stall with no error — clients select a dozen
@@ -86,8 +118,9 @@ export function UploadForm({ eventId }: { eventId: string }) {
     let uploadedCount = 0;
 
     for (let i = 0; i < queue.length; i++) {
-      const file = queue[i];
       const label = `${i + 1} of ${queue.length}`;
+      setStatusLine(`Preparing ${label}…`);
+      const file = await compressPhoto(queue[i]);
       setStatusLine(`Uploading ${label} — 0%`);
       try {
         const { status, body } = await uploadOne(file, (percent) =>
