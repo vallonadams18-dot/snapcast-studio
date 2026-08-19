@@ -7,7 +7,7 @@ import { ErrorState, SuccessBanner } from "@/components/States";
 
 // Mirrors MAX_UPLOAD_BYTES in lib/uploadValidation.ts — this is just a fast
 // client-side check for instant feedback; the server enforces the real limit.
-const MAX_UPLOAD_BYTES = 150 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 300 * 1024 * 1024;
 
 export function UploadForm({ eventId }: { eventId: string }) {
   const router = useRouter();

@@ -10,10 +10,15 @@
 // video editor never sees.
 import { detectMediaType, MAX_SNIFF_BYTES, type DetectedType } from "./webhooks/safeDownload.ts";
 
-// Generous enough for phone-shot event photos/video clips, bounded enough
-// that one upload can't exhaust memory/disk or kick off a runaway ffmpeg
-// job. Mirrored client-side in UploadForm for instant feedback.
-export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024;
+// Deliberately aligned with the platforms this footage is destined for:
+// TikTok's iPhone app caps uploads at ~288MB and Instagram's API ceiling is
+// 300MB, so 300MB accepts anything a phone would hand those apps. It is
+// also the most this droplet can safely buffer per upload (2GB RAM, whole
+// file held in memory during validation) — raising it further needs a
+// streaming-ingest rework, not just a bigger number. Mirrored client-side
+// in UploadForm for instant feedback; nginx client_max_body_size must stay
+// above it (see deploy/nginx-snapcast.conf, 350M).
+export const MAX_UPLOAD_BYTES = 300 * 1024 * 1024;
 
 export type EventUploadVerdict =
   | { ok: true; detected: DetectedType }
